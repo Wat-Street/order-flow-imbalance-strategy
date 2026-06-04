@@ -10,6 +10,8 @@ import logging.config
 import concurrent.futures
 import time
 
+from tqdm import tqdm
+
 
 LOG_CONFIG = {
     "version": 1,
@@ -80,7 +82,7 @@ def main():
         ]
         
         # we can add tqdm progress bar here 
-        for future in concurrent.futures.as_completed(futures):
+        for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="Downloading data"):
             result = future.result()
             status = result["status"]
             results[status] += 1
@@ -99,6 +101,7 @@ def generate_tasks(args, data_dir):
                 output.append((data_type, symbol, date_str))
                 current_date += delta
     return output
+
 #step 3, check if output CSV already exists
 def check_task_exists(data_dir, data_type, symbol, date_str):
     base = Path(data_dir)
@@ -215,6 +218,23 @@ def extract_csv(zip_path, output_directory):
         else:
             logger.error("Zip contains multiple files, skipping extraction")
             return False
+        
+        file = files[0]
+
+        extracted_path = (Path(output_directory) / file).resolve()
+        output = Path(output_directory).resolve()
+
+        if output not in extracted_path.parents:
+            logger.error("Unsafe extraction path detected for zip=%s, extracted_path=%s, output_directory=%s; skipping extraction", zip_path, extracted_path, output_directory)
+            return False
+        
+        zipped_file.extract(file, output_directory)
+
+    Path(zip_path).unlink()
+    
+    logger.info("Extraction successful: output_directory=%s", output_directory)
+    return True
+        
 
 
 def process_task(data_dir, data_type, symbol, date_str):
