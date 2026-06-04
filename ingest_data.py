@@ -200,25 +200,9 @@ def validate_checksum(expected_hash, zip_path):
 # step 7: extract the CSV from the zip file
 def extract_csv(zip_path, output_directory):
     with zipfile.ZipFile(zip_path, 'r') as zipped_file:
-        files = zipped_file.namelist()
-
-        if len(files) == 1:
-            file = files[0]
-
-            extracted_path = (Path(output_directory) / file).resolve()
-            output = Path(output_directory).resolve()
-
-            if output in extracted_path.parents:
-                # Wrap in try-except?
-                zipped_file.extract(file, output_directory)
-                Path(zip_path).unlink()
-                logger.info("Extraction successful: output_directory=%s", output_directory)
-                return True
-            else:
-                logger.error("Unsafe extraction path detected for zip=%s, extracted_path=%s, output_directory=%s; skipping extraction", zip_path, extracted_path, output_directory)
-                return False
-        else:
-            logger.error("Zip contains multiple files, skipping extraction")
+        files = zipped_file.namelist()   
+        if len(files) != 1:
+            logger.error("Zip contains multiple files, skipping extraction: zip=%s files=%s", zip_path, files)
             return False
         
         file = files[0]
@@ -230,13 +214,12 @@ def extract_csv(zip_path, output_directory):
             logger.error("Unsafe extraction path detected for zip=%s, extracted_path=%s, output_directory=%s; skipping extraction", zip_path, extracted_path, output_directory)
             return False
         
-        zip.extract(file, output_directory)
+        zipped_file.extract(file, output_directory)
 
     Path(zip_path).unlink()
 
     logger.info("Extraction successful: output_directory=%s", output_directory)
     return True
-
         
 
 
