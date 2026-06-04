@@ -3,6 +3,50 @@ import datetime as dt
 import sys
 from datetime import timedelta
 from pathlib import Path
+import hashlib
+import zipfile
+import logging
+import logging.config
+import concurrent.futures
+
+from tqdm import tqdm
+
+
+LOG_CONFIG = {
+    "version": 1,
+    "formatters": {
+        "standard": {
+            "format": "%(asctime)s - %(levelname)s - %(message)s"
+        }
+    },
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "level": "INFO",
+            "stream": "ext://sys.stdout",
+            "formatter": "standard",
+        },
+        "file": {
+            "class": "logging.FileHandler",
+            "filename": "logs/download.log",
+            "level": "DEBUG",
+            "mode": "a",
+            "formatter": "standard"
+        }
+    },
+    "loggers": {
+        "root_logger": {
+            "handlers": ["console", "file"],
+            "level": "DEBUG",
+        }
+    }
+}
+# Make the logs folder directory if it doesn't exist
+Path("logs").mkdir(exist_ok=True)
+logging.config.dictConfig(LOG_CONFIG)
+logger = logging.getLogger("root_logger")
+
+# define CLI arguments and validate them
 import requests
 
 url = "https://data.binance.vision/data/futures/um/daily"
@@ -39,7 +83,7 @@ def main():
         ]
         
         # we can add tqdm progress bar here 
-        for future in concurrent.futures.as_completed(futures):
+        for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="Downloading data"):
             result = future.result()
             status = result["status"]
             results[status] += 1
@@ -58,6 +102,7 @@ def generate_tasks(args, data_dir):
                 output.append((data_type, symbol, date_str))
                 current_date += delta
     return output
+
 #step 3, check if output CSV already exists
 def check_task_exists(data_dir, data_type, symbol, date_str):
     base = Path(data_dir)
@@ -133,24 +178,27 @@ def extract_csv(zip_path, output_directory):
     with zipfile.ZipFile(zip_path, 'r') as zip:
         files = zip.namelist()
 
-        if len(files) == 1:
-            file = files[0]
-
-            extracted_path = (Path(output_directory) / file).resolve()
-            output = Path(output_directory).resolve()
-
-            if output in extracted_path.parents:
-                # Wrap in try-except?
-                zip.extract(file, output_directory)
-                Path(zip_path).unlink()
-                logger.info("Extraction successful: output_directory=%s", output_directory)
-                return True
-            else:
-                logger.error("Unsafe extraction path detected for zip=%s, extracted_path=%s, output_directory=%s; skipping extraction", zip_path, extracted_path, output_directory)
-                return False
-        else:
-            logger.error("Zip contains multiple files, skipping extraction")
+        if len(files) != 1:
+            logger.error("Zip contains multiple files, skipping extraction: zip=%s files=%s", zip_path, files)
             return False
+        
+        file = files[0]
+
+        extracted_path = (Path(output_directory) / file).resolve()
+        output = Path(output_directory).resolve()
+
+        if output not in extracted_path.parents:
+            logger.error("Unsafe extraction path detected for zip=%s, extracted_path=%s, output_directory=%s; skipping extraction", zip_path, extracted_path, output_directory)
+            return False
+        
+        zip.extract(file, output_directory)
+
+    Path(zip_path).unlink()
+    
+    logger.info("Extraction successful: output_directory=%s", output_directory)
+    return True
+
+        
 
 import time
 
