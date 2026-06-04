@@ -28,18 +28,23 @@ def main():
     #step 2
     tasks = generate_tasks(args, data_dir)
     print(f"Generated {len(tasks)} tasks to process!")
-    #step 3
-    for data_type, symbol, date_str in tasks:
-        if check_task_exists(data_dir, data_type, symbol, date_str):
-            print(f"-> Skipping {symbol} {data_type} for {date_str} (File exists)")
-            continue
-        hashh = download_checksum(data_dir, data_type, symbol, date_str)
-        if hashh is None:
-            print(f"-> Skipping {symbol} {data_type} for {date_str} (404 Not Found)")
-            continue
-        print(f"-> Downloading {symbol} {data_type} for {date_str}...")
-        success = download_zip(data_dir, data_type, symbol, date_str)
-     
+    # step 9, submit tasks to ThreadPoolExecutor to download tasks in parallel
+    # data_dir is the root output director, e.g. data/raw, and then the download task function creates the full download path
+    # tasks is a list of tuples created in step 2
+    results = {"ok": 0, "skipped": 0, "missing": 0, "checksum_failed": 0, "error": 0}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
+        futures = [
+            executor.submit(process_task, data_dir, data_type, symbol, date_str)
+            for data_type, symbol, date_str in tasks
+        ]
+        
+        # we can add tqdm progress bar here 
+        for future in concurrent.futures.as_completed(futures):
+            result = future.result()
+            status = result["status"]
+            results[status] += 1
+        print(f"\nDownload process complete. Summary: {results}")
+
     
 #step 2, list of tuples for requested range (data_type, symbol, date_str)
 def generate_tasks(args, data_dir):
@@ -53,7 +58,6 @@ def generate_tasks(args, data_dir):
                 output.append((data_type, symbol, date_str))
                 current_date += delta
     return output
-
 #step 3, check if output CSV already exists
 def check_task_exists(data_dir, data_type, symbol, date_str):
     base = Path(data_dir)
@@ -67,7 +71,7 @@ def check_task_exists(data_dir, data_type, symbol, date_str):
             return True
     return False
 
-#step 4, download checksum file before zip
+#step 4
 def download_checksum(data_dir, data_type, symbol, date_str):
     base = Path(data_dir)
     if data_type == "klines":
@@ -100,6 +104,77 @@ def download_zip(data_dir, data_type, symbol, date_str):
                 f.write(chunk)
     return zip_path
 
+      
+# step 6: hash the downloaded zip and compare against the checksum file's expected hash
+def validate_checksum(expected_hash, zip_path):    
+    sha256_hash = hashlib.sha256()
+    with open(zip_path, "rb") as zip_file:
+        while True:
+            chunk = zip_file.read(8192)
+            if not chunk:
+                break
+            sha256_hash.update(chunk)
+    
+    calculated_hash = sha256_hash.hexdigest()
+    
+    # get zip file size for logging
+    size = Path(zip_path).stat().st_size
+
+    if calculated_hash == expected_hash:
+        logger.info("Checksum PASSED: zip=%s expected=%s actual=%s zip_size=%s", zip_path, expected_hash, calculated_hash, size)
+    else:
+        Path(zip_path).unlink()
+        logger.error("Checksum FAILED: zip=%s expected=%s actual=%s zip_size=%s; zip file deleted", zip_path, expected_hash, calculated_hash, size)
+
+    return calculated_hash == expected_hash
+
+# step 7: extract the CSV from the zip file
+def extract_csv(zip_path, output_directory):
+    with zipfile.ZipFile(zip_path, 'r') as zip:
+        files = zip.namelist()
+
+        if len(files) == 1:
+            file = files[0]
+
+            extracted_path = (Path(output_directory) / file).resolve()
+            output = Path(output_directory).resolve()
+
+            if output in extracted_path.parents:
+                # Wrap in try-except?
+                zip.extract(file, output_directory)
+                Path(zip_path).unlink()
+                logger.info("Extraction successful: output_directory=%s", output_directory)
+                return True
+            else:
+                logger.error("Unsafe extraction path detected for zip=%s, extracted_path=%s, output_directory=%s; skipping extraction", zip_path, extracted_path, output_directory)
+                return False
+        else:
+            logger.error("Zip contains multiple files, skipping extraction")
+            return False
+
+import time
+
+def process_task(data_dir, data_type, symbol, date_str):
+    try:
+        if check_task_exists(data_dir, data_type, symbol, date_str):
+            logger.debug(f"Skipped {symbol} {data_type} {date_str} (exists)")
+            return {"status": "skipped"}
+        expected_hash = download_checksum(data_dir, data_type, symbol, date_str)
+        if expected_hash is None:
+            logger.debug(f"Missing {symbol} {data_type} {date_str} (404)")
+            return {"status": "missing"}       
+        logger.info(f"Downloading {symbol} {data_type} {date_str}...")
+        zip_path = download_zip(data_dir, data_type, symbol, date_str)   
+        if not validate_checksum(expected_hash, zip_path):
+            return {"status": "checksum_failed"}    
+        base = Path(data_dir) / symbol / data_type
+        if extract_csv(zip_path, base):
+            return {"status": "ok"}
+        else:
+            return {"status": "error"}            
+    except Exception as e:
+        logger.error(f"Error processing {symbol} {data_type} {date_str}: {str(e)}")
+        return {"status": "error"}
 
 if __name__ == "__main__":
     main()
