@@ -11,7 +11,7 @@ import concurrent.futures
 
 from tqdm import tqdm
 
-
+# step 8: configure logging 
 LOG_CONFIG = {
     "version": 1,
     "formatters": {
@@ -191,7 +191,7 @@ def extract_csv(zip_path, output_directory):
         zip.extract(file, output_directory)
 
     Path(zip_path).unlink()
-    
+
     logger.info("Extraction successful: output_directory=%s", output_directory)
     return True
 
