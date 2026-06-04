@@ -8,6 +8,7 @@ import zipfile
 import logging
 import logging.config
 import concurrent.futures
+import time
 
 
 LOG_CONFIG = {
@@ -118,13 +119,23 @@ def download_checksum(data_dir, data_type, symbol, date_str):
         path_url = f"{url}/klines/{symbol}/1m/{symbol}-1m-{date_str}.zip.CHECKSUM"
     else:
         path_url = f"{url}/{data_type}/{symbol}/{symbol}-{data_type}-{date_str}.zip.CHECKSUM"
-    response = requests.get(path_url)
-    if response.status_code == 404:
-        return None
-    response.raise_for_status()
-    return response.text.strip().split()[0]
-
- #step 5, download zip file, extract
+    MAX_RETRIES = 3
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = requests.get(path_url)
+            if response.status_code == 404:
+                return None
+            response.raise_for_status()
+            return response.text.strip().split()[0]
+        except requests.HTTPError:
+            if attempt == MAX_RETRIES:
+                raise
+            time.sleep(2 ** attempt)
+        except requests.RequestException:
+            if attempt == MAX_RETRIES:
+                raise
+            time.sleep(2 ** attempt)
+ #step 5, download zip file
 def download_zip(data_dir, data_type, symbol, date_str):
     base = Path(data_dir) / symbol / data_type
     base.mkdir(parents=True, exist_ok=True)
@@ -135,8 +146,22 @@ def download_zip(data_dir, data_type, symbol, date_str):
         zip_filename = f"{symbol}-{data_type}-{date_str}.zip"
         zip_url = f"{url}/{data_type}/{symbol}/{zip_filename}"
     zip_path = base / zip_filename
-    response = requests.get(zip_url, stream=True)
-    response.raise_for_status()
+    MAX_RETRIES = 3
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = requests.get(zip_url, stream=True)
+            if response.status_code == 404:
+                return None
+            response.raise_for_status()
+            break
+        except requests.HTTPError:
+            if attempt == MAX_RETRIES:
+                raise
+            time.sleep(2 ** attempt)
+        except requests.RequestException:
+            if attempt == MAX_RETRIES:
+                raise
+            time.sleep(2 ** attempt)
     with open(zip_path, "wb") as f:
         for chunk in response.iter_content(chunk_size=8*1024*1024):
             if chunk:
@@ -149,7 +174,7 @@ def validate_checksum(expected_hash, zip_path):
     sha256_hash = hashlib.sha256()
     with open(zip_path, "rb") as zip_file:
         while True:
-            chunk = zip_file.read(8192)
+            chunk = zip_file.read(8 * 1024 * 1024)
             if not chunk:
                 break
             sha256_hash.update(chunk)
@@ -169,8 +194,8 @@ def validate_checksum(expected_hash, zip_path):
 
 # step 7: extract the CSV from the zip file
 def extract_csv(zip_path, output_directory):
-    with zipfile.ZipFile(zip_path, 'r') as zip:
-        files = zip.namelist()
+    with zipfile.ZipFile(zip_path, 'r') as zipped_file:
+        files = zipped_file.namelist()
 
         if len(files) == 1:
             file = files[0]
@@ -180,7 +205,7 @@ def extract_csv(zip_path, output_directory):
 
             if output in extracted_path.parents:
                 # Wrap in try-except?
-                zip.extract(file, output_directory)
+                zipped_file.extract(file, output_directory)
                 Path(zip_path).unlink()
                 logger.info("Extraction successful: output_directory=%s", output_directory)
                 return True
@@ -191,7 +216,6 @@ def extract_csv(zip_path, output_directory):
             logger.error("Zip contains multiple files, skipping extraction")
             return False
 
-import time
 
 def process_task(data_dir, data_type, symbol, date_str):
     try:
@@ -204,10 +228,14 @@ def process_task(data_dir, data_type, symbol, date_str):
             return {"status": "missing"}       
         logger.info(f"Downloading {symbol} {data_type} {date_str}...")
         zip_path = download_zip(data_dir, data_type, symbol, date_str)   
+        if zip_path is None:
+            logger.warning(f"Zip 404'd after checksum passed for {symbol} {data_type} {date_str} — skipping")
+            return {"status": "missing"}
         if not validate_checksum(expected_hash, zip_path):
             return {"status": "checksum_failed"}    
         base = Path(data_dir) / symbol / data_type
         if extract_csv(zip_path, base):
+            time.sleep(0.1) 
             return {"status": "ok"}
         else:
             return {"status": "error"}            
