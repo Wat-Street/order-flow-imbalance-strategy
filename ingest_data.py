@@ -71,9 +71,8 @@ def main():
     #step 2
     tasks = generate_tasks(args, data_dir)
     print(f"Generated {len(tasks)} tasks to process!")
+    
     # step 9, submit tasks to ThreadPoolExecutor to download tasks in parallel
-    # data_dir is the root output director, e.g. data/raw, and then the download task function creates the full download path
-    # tasks is a list of tuples created in step 2
     results = {"ok": 0, "skipped": 0, "missing": 0, "checksum_failed": 0, "error": 0}
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
         futures = [
@@ -81,7 +80,6 @@ def main():
             for data_type, symbol, date_str in tasks
         ]
         
-        # we can add tqdm progress bar here 
         for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="Downloading data"):
             result = future.result()
             status = result["status"]
@@ -200,23 +198,8 @@ def extract_csv(zip_path, output_directory):
     with zipfile.ZipFile(zip_path, 'r') as zipped_file:
         files = zipped_file.namelist()
 
-        if len(files) == 1:
-            file = files[0]
-
-            extracted_path = (Path(output_directory) / file).resolve()
-            output = Path(output_directory).resolve()
-
-            if output in extracted_path.parents:
-                # Wrap in try-except?
-                zipped_file.extract(file, output_directory)
-                Path(zip_path).unlink()
-                logger.info("Extraction successful: output_directory=%s", output_directory)
-                return True
-            else:
-                logger.error("Unsafe extraction path detected for zip=%s, extracted_path=%s, output_directory=%s; skipping extraction", zip_path, extracted_path, output_directory)
-                return False
-        else:
-            logger.error("Zip contains multiple files, skipping extraction")
+        if len(files) != 1:
+            logger.error("Zip contains multiple files, skipping extraction, zip=%s, files=%s", zip_path, files)
             return False
         
         file = files[0]
@@ -229,7 +212,7 @@ def extract_csv(zip_path, output_directory):
             return False
         
         zipped_file.extract(file, output_directory)
-
+    
     Path(zip_path).unlink()
 
     logger.info("Extraction successful: output_directory=%s", output_directory)
