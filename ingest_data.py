@@ -1,7 +1,7 @@
 import argparse
+from asyncio import tasks
 import datetime as dt
 import sys
-from datetime import timedelta
 from pathlib import Path
 import hashlib
 import zipfile
@@ -62,18 +62,22 @@ def main():
     parser.add_argument("--workers", help = "parallelism", type=int, default=4)
     parser.add_argument("--data-dir", help = "output root", default="data/raw" )
     parser.add_argument("--validate", action="store_true",help = "run validation test after downloading")
-    data_types = []
+
     args = parser.parse_args()
     if args.start > args.end:
+        logger.error("Invalid date range entered: start=%s end=%s", args.start, args.end)
         sys.exit("start date must be before end date")
+    
     data_dir = Path(args.data_dir)
 
     #step 2
     tasks = generate_tasks(args, data_dir)
-    print(f"Generated {len(tasks)} tasks to process!")
+    logger.info("Generated %s tasks to process", len(tasks))
     
     # step 9, submit tasks to ThreadPoolExecutor to download tasks in parallel
     results = {"ok": 0, "skipped": 0, "missing": 0, "checksum_failed": 0, "error": 0}
+    logger.info("Submitting tasks to thread pool with %s workers", args.workers)
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
         futures = [
             executor.submit(process_task, data_dir, data_type, symbol, date_str)
@@ -84,7 +88,7 @@ def main():
             result = future.result()
             status = result["status"]
             results[status] += 1
-        print(f"\nDownload process complete. Summary: {results}")
+        logger.info("Download process complete. Summary: %s", results)
 
     
 #step 2, list of tuples for requested range (data_type, symbol, date_str)
@@ -115,7 +119,7 @@ def check_task_exists(data_dir, data_type, symbol, date_str):
 
 #step 4
 def download_checksum(data_dir, data_type, symbol, date_str):
-    base = Path(data_dir)
+
     if data_type == "klines":
         path_url = f"{url}/klines/{symbol}/1m/{symbol}-1m-{date_str}.zip.CHECKSUM"
     else:
@@ -125,16 +129,21 @@ def download_checksum(data_dir, data_type, symbol, date_str):
         try:
             response = requests.get(path_url)
             if response.status_code == 404:
+                logger.info("Checksum file not found (404): symbol=%s type=%s date=%s", symbol, data_type, date_str)
                 return None
             response.raise_for_status()
             return response.text.strip().split()[0]
         except requests.HTTPError:
             if attempt == MAX_RETRIES:
+                logger.exception("Checksum fetch failed after retries: symbol=%s type=%s date=%s", symbol, data_type, date_str)
                 raise
+            logger.warning("Checksum fetch HTTP error, retrying: symbol=%s type=%s date=%s attempt=%s", symbol, data_type, date_str, attempt)
             time.sleep(2 ** attempt)
         except requests.RequestException:
             if attempt == MAX_RETRIES:
+                logger.exception("Checksum fetch failed after retries: symbol=%s type=%s date=%s", symbol, data_type, date_str)
                 raise
+            logger.warning("Checksum request error, retrying: symbol=%s type=%s date=%s attempt=%s", symbol, data_type, date_str, attempt)
             time.sleep(2 ** attempt)
  #step 5, download zip file
 def download_zip(data_dir, data_type, symbol, date_str):
@@ -152,21 +161,28 @@ def download_zip(data_dir, data_type, symbol, date_str):
         try:
             response = requests.get(zip_url, stream=True)
             if response.status_code == 404:
+                logger.info("Zip file not found (404): symbol=%s type=%s date=%s", symbol, data_type, date_str)
                 return None
             response.raise_for_status()
             break
         except requests.HTTPError:
             if attempt == MAX_RETRIES:
+                logger.exception("Zip download failed after retries: symbol=%s type=%s date=%s", symbol, data_type, date_str)
                 raise
+            logger.warning("Zip download HTTP error, retrying: symbol=%s type=%s date=%s attempt=%s", symbol, data_type, date_str, attempt)
             time.sleep(2 ** attempt)
         except requests.RequestException:
             if attempt == MAX_RETRIES:
+                logger.exception("Zip download failed after retries: symbol=%s type=%s date=%s", symbol, data_type, date_str)
                 raise
+            logger.warning("Zip download request error, retrying: symbol=%s type=%s date=%s attempt=%s", symbol, data_type, date_str, attempt)
             time.sleep(2 ** attempt)
+
     with open(zip_path, "wb") as f:
         for chunk in response.iter_content(chunk_size=8*1024*1024):
             if chunk:
                 f.write(chunk)
+    logger.info("Zip downloaded successfully: path=%s size=%.2f MB", zip_path, zip_path.stat().st_size / (1024 * 1024))
     return zip_path
 
       
@@ -183,13 +199,13 @@ def validate_checksum(expected_hash, zip_path):
     calculated_hash = sha256_hash.hexdigest()
     
     # get zip file size for logging
-    size = Path(zip_path).stat().st_size
+    size = Path(zip_path).stat().st_size / (1024 * 1024)
 
     if calculated_hash == expected_hash:
-        logger.info("Checksum PASSED: zip=%s expected=%s actual=%s zip_size=%s", zip_path, expected_hash, calculated_hash, size)
+        logger.info("Checksum PASSED: zip=%s expected=%s actual=%s zip_size=%.2f MB", zip_path, expected_hash, calculated_hash, size)
     else:
         Path(zip_path).unlink()
-        logger.error("Checksum FAILED: zip=%s expected=%s actual=%s zip_size=%s; zip file deleted", zip_path, expected_hash, calculated_hash, size)
+        logger.error("Checksum FAILED: zip=%s expected=%s actual=%s zip_size=%.2f MB; zip file deleted", zip_path, expected_hash, calculated_hash, size)
 
     return calculated_hash == expected_hash
 
@@ -215,7 +231,7 @@ def extract_csv(zip_path, output_directory):
     
     Path(zip_path).unlink()
 
-    logger.info("Extraction successful: output_directory=%s", output_directory)
+    logger.info("Extraction successful: output_directory=%s size=%.2f MB", output_directory, extracted_path.stat().st_size / (1024 * 1024))
     return True
         
 
