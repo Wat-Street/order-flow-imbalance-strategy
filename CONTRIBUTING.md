@@ -30,3 +30,4 @@ chmod +x scripts/check.sh
 - Require pull request + **1 approval**
 - Require status check **Lint & Test** *(shows up after the first PR runs CI)*
 - Block force pushes
+

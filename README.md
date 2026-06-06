@@ -25,4 +25,4 @@ This project builds a context-aware ML system that improves OFI using:
 
 ## Status
 
-Early-stage development (Phase 1: Data Ingestion + Pipeline Foundation)
+Early-stage development ( Phase 1: Data Ingestion + Pipeline Foundation )
