@@ -1,3 +1,7 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "order-flow-imbalance-strategy"
 version = "0.1.0"
@@ -5,7 +9,7 @@ description = "ML-enhanced Order Flow Imbalance research pipeline for crypto mar
 readme = "README.md"
 requires-python = ">=3.11"
 
-[dependency-groups]
+[project.optional-dependencies]
 dev = [
     "pytest>=8.0",
     "ruff>=0.9",
