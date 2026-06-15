@@ -10,7 +10,8 @@ from pathlib import Path
 import pytest
 import requests
 
-import ingest_data
+import order_flow_imbalance_strategy
+import order_flow_imbalance_strategy.ingest_data as ingest_data
 
 
 @pytest.fixture(autouse=True)
@@ -50,7 +51,7 @@ class TestGenerateTasks:
             start=dt.datetime.fromisoformat("2024-01-01"),
             end=dt.datetime.fromisoformat("2024-01-03"),
         )
-        tasks = ingest_data.generate_tasks(args, Path("data/raw"))
+        tasks = order_flow_imbalance_strategy.ingest_data.generate_tasks(args, Path("data/raw"))
         dates = [t[2] for t in tasks]
         assert "2024-01-01" in dates
         assert "2024-01-02" in dates
@@ -483,11 +484,12 @@ class TestProcessTask:
 
 
 class TestRunValidation:
-    def test_valid_aggtrades_csv_passes(self, tmp_path):
+    def test_valid_aggtrades_csv_passes(self, tmp_path, caplog):
         csv_dir = tmp_path / "BTCUSDT" / "aggTrades"
         csv_dir.mkdir(parents=True)
         csv_path = csv_dir / "BTCUSDT-aggTrades-2024-01-01.csv"
-        csv_path.write_text("1,50000,1.5,1,1,1704067200000,True\n")
+        header = ",".join(ingest_data.COLUMNS["aggTrades"])
+        csv_path.write_text(f"{header}\n1,50000,1.5,1,1,1704067200000,True\n")
 
         args = Namespace(
             symbols=["BTCUSDT"],
@@ -495,22 +497,30 @@ class TestRunValidation:
             start=dt.datetime.fromisoformat("2024-01-01"),
             end=dt.datetime.fromisoformat("2024-01-01"),
         )
-        ingest_data.run_validation(tmp_path, args)
+        import logging
 
-    def test_valid_klines_csv_passes(self, tmp_path):
+        with caplog.at_level(logging.ERROR):
+            ingest_data.run_validation(tmp_path, args)
+        assert not any("FAILED" in r.message for r in caplog.records)
+
+    def test_valid_klines_csv_passes(self, tmp_path, caplog):
         csv_dir = tmp_path / "BTCUSDT" / "klines"
         csv_dir.mkdir(parents=True)
         csv_path = csv_dir / "BTCUSDT-1m-2024-01-01.csv"
+        header = ",".join(ingest_data.COLUMNS["klines"])
         row = "1704067200000,50000,50100,49900,50050,100,1704067260000,5000000,200,50,2500000,0\n"
-        csv_path.write_text(row)
-
+        csv_path.write_text(f"{header}\n{row}")
         args = Namespace(
             symbols=["BTCUSDT"],
             types=["klines"],
             start=dt.datetime.fromisoformat("2024-01-01"),
             end=dt.datetime.fromisoformat("2024-01-01"),
         )
-        ingest_data.run_validation(tmp_path, args)
+        import logging
+
+        with caplog.at_level(logging.ERROR):
+            ingest_data.run_validation(tmp_path, args)
+        assert not any("FAILED" in r.message for r in caplog.records)
 
     def test_missing_csv_skipped_gracefully(self, tmp_path):
         args = Namespace(
