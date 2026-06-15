@@ -602,7 +602,7 @@ class TestLiveNetworkPipeline:
         assert result["status"] == "ok"
         csv_path = tmp_path / "BTCUSDT" / "klines" / "BTCUSDT-1m-2024-01-01.csv"
         cols = ingest_data.COLUMNS["klines"]
-        df = pd.read_csv(csv_path, header=None, names=cols, nrows=5)
+        df = pd.read_csv(csv_path, header=0, nrows=5)
         assert list(df.columns) == cols
         assert len(df) > 0
 
@@ -619,13 +619,12 @@ class TestLiveNetworkPipeline:
             csv_path = tmp_path / "BTCUSDT" / "bookTicker" / "BTCUSDT-bookTicker-2024-01-01.csv"
             assert csv_path.exists()
 
-    def test_network_aggtrades_csv_has_no_header_row(self, tmp_path):
+    def test_network_aggtrades_csv_columns_match_schema(self, tmp_path):
         import pandas as pd
 
         result = ingest_data.process_task(tmp_path, "aggTrades", "BTCUSDT", "2024-01-01")
         assert result["status"] == "ok"
         csv_path = tmp_path / "BTCUSDT" / "aggTrades" / "BTCUSDT-aggTrades-2024-01-01.csv"
-        cols = ingest_data.COLUMNS["aggTrades"]
-        df = pd.read_csv(csv_path, header=None, names=cols, nrows=2)
+        df = pd.read_csv(csv_path, header=0, nrows=2)
         assert len(df) > 0
         assert "agg_trade_id" in df.columns

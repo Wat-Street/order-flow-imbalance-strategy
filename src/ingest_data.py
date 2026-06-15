@@ -250,15 +250,15 @@ COLUMNS = {
         "volume",
         "close_time",
         "quote_volume",
-        "num_trades",
-        "taker_buy_base_volume",
+        "count",
+        "taker_buy_volume",
         "taker_buy_quote_volume",
         "ignore",
     ],
     "aggTrades": [
         "agg_trade_id",
         "price",
-        "qty",
+        "quantity",
         "first_trade_id",
         "last_trade_id",
         "transact_time",
@@ -297,7 +297,7 @@ def run_validation(data_dir, args):
                     continue
                 cols = COLUMNS[data_type]
                 try:
-                    df_raw = pd.read_csv(csv_path, nrows=5, header=None)
+                    df_raw = pd.read_csv(csv_path, nrows=5, header=0)
                     assert len(df_raw.columns) == len(cols), (
                         f"Column count mismatch: expected {len(cols)}, got {len(df_raw.columns)}"
                     )
