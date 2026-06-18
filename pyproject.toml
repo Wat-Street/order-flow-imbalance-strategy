@@ -8,6 +8,10 @@ version = "0.1.0"
 description = "ML-enhanced Order Flow Imbalance research pipeline for crypto markets"
 readme = "README.md"
 requires-python = ">=3.11"
+dependencies = [
+    "polars>=1.0",
+    "tqdm>=4.66",
+]
 
 [project.optional-dependencies]
 dev = [
