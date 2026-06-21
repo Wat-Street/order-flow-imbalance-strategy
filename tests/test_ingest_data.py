@@ -13,6 +13,21 @@ import requests
 import order_flow_imbalance_strategy
 import order_flow_imbalance_strategy.ingest_data as ingest_data
 
+VALID_AGGTRADES_CSV = (
+    "agg_trade_id,price,quantity,first_trade_id,last_trade_id,transact_time,is_buyer_maker\n"
+    "1,50000.0,1.5,1,1,1704067200000,True\n"
+)
+VALID_KLINES_CSV = (
+    "open_time,open,high,low,close,volume,close_time,quote_volume,count,"
+    "taker_buy_volume,taker_buy_quote_volume,ignore\n"
+    "1704067200000,50000,50100,49900,50050,100,1704067260000,5000000,200,50,2500000,0\n"
+)
+VALID_BOOKTICKER_CSV = (
+    "update_id,best_bid_price,best_bid_qty,best_ask_price,best_ask_qty,"
+    "transaction_time,event_time\n"
+    "1,50000.0,1.5,50001.0,1.5,1704067200000,1704067200000\n"
+)
+
 
 @pytest.fixture(autouse=True)
 def mock_global_sleep(monkeypatch, request):
@@ -119,19 +134,19 @@ class TestCheckTaskExists:
     def test_returns_true_when_aggtrades_csv_exists(self, tmp_path):
         trade_dir = tmp_path / "BTCUSDT" / "aggTrades"
         trade_dir.mkdir(parents=True)
-        (trade_dir / "BTCUSDT-aggTrades-2024-01-01.csv").touch()
+        (trade_dir / "BTCUSDT-aggTrades-2024-01-01.csv").write_text(VALID_AGGTRADES_CSV)
         assert ingest_data.check_task_exists(tmp_path, "aggTrades", "BTCUSDT", "2024-01-01") is True
 
     def test_returns_true_when_klines_csv_exists(self, tmp_path):
         klines_dir = tmp_path / "BTCUSDT" / "klines"
         klines_dir.mkdir(parents=True)
-        (klines_dir / "BTCUSDT-1m-2024-01-01.csv").touch()
+        (klines_dir / "BTCUSDT-1m-2024-01-01.csv").write_text(VALID_KLINES_CSV)
         assert ingest_data.check_task_exists(tmp_path, "klines", "BTCUSDT", "2024-01-01") is True
 
     def test_returns_true_when_bookticker_csv_exists(self, tmp_path):
         bt_dir = tmp_path / "ETHUSDT" / "bookTicker"
         bt_dir.mkdir(parents=True)
-        (bt_dir / "ETHUSDT-bookTicker-2024-05-10.csv").touch()
+        (bt_dir / "ETHUSDT-bookTicker-2024-05-10.csv").write_text(VALID_BOOKTICKER_CSV)
         assert (
             ingest_data.check_task_exists(tmp_path, "bookTicker", "ETHUSDT", "2024-05-10") is True
         )
@@ -147,7 +162,15 @@ class TestCheckTaskExists:
     def test_different_date_not_matched(self, tmp_path):
         trade_dir = tmp_path / "BTCUSDT" / "aggTrades"
         trade_dir.mkdir(parents=True)
-        (trade_dir / "BTCUSDT-aggTrades-2024-01-02.csv").touch()
+        (trade_dir / "BTCUSDT-aggTrades-2024-01-02.csv").write_text(VALID_AGGTRADES_CSV)
+        assert (
+            ingest_data.check_task_exists(tmp_path, "aggTrades", "BTCUSDT", "2024-01-01") is False
+        )
+
+    def test_zero_byte_csv_not_considered_complete(self, tmp_path):
+        trade_dir = tmp_path / "BTCUSDT" / "aggTrades"
+        trade_dir.mkdir(parents=True)
+        (trade_dir / "BTCUSDT-aggTrades-2024-01-01.csv").touch()  # 0 bytes, e.g. crash artifact
         assert (
             ingest_data.check_task_exists(tmp_path, "aggTrades", "BTCUSDT", "2024-01-01") is False
         )
@@ -274,6 +297,20 @@ class TestDownloadChecksumUnit:
         result = ingest_data.download_checksum(Path("dummy"), "bookTicker", "ETHUSDT", "2024-01-01")
         assert result == "cafebabe"
 
+    def test_passes_request_timeout(self, monkeypatch):
+        captured = {}
+        class _Resp:
+            status_code = 200
+            text = "deadbeef  BTCUSDT-aggTrades-2024-01-01.zip\n"
+            def raise_for_status(self):
+                pass
+        def fake_get(url, **kwargs):
+            captured.update(kwargs)
+            return _Resp()
+        monkeypatch.setattr(ingest_data.requests, "get", fake_get)
+        ingest_data.download_checksum(Path("dummy"), "aggTrades", "BTCUSDT", "2024-01-01")
+        assert captured.get("timeout") == ingest_data.REQUEST_TIMEOUT
+
 
 class TestDownloadZipUnit:
     def _make_zip_bytes(self, filename="data.csv", content="1,2,3"):
@@ -342,6 +379,64 @@ class TestDownloadZipUnit:
         assert 2 in backoff_sleeps
         assert 4 in backoff_sleeps
 
+    def test_passes_request_timeout_and_stream(self, tmp_path, monkeypatch):
+        zip_bytes = self._make_zip_bytes()
+        captured = {}
+        class _Resp:
+            status_code = 200
+            def raise_for_status(self):
+                pass
+            def iter_content(self, chunk_size):
+                yield zip_bytes
+        def fake_get(url, **kwargs):
+            captured.update(kwargs)
+            return _Resp()
+        monkeypatch.setattr(ingest_data.requests, "get", fake_get)
+        ingest_data.download_zip(tmp_path, "aggTrades", "BTCUSDT", "2024-01-01")
+        assert captured.get("timeout") == ingest_data.REQUEST_TIMEOUT
+        assert captured.get("stream") is True
+
+    def test_mid_stream_failure_deletes_partial_and_retries(self, tmp_path, monkeypatch):
+        zip_bytes = self._make_zip_bytes()
+        state = {"calls": 0}
+
+        class _FlakyResp:
+            status_code = 200
+            def __init__(self, mode):
+                self.mode = mode
+
+            def raise_for_status(self):
+                pass
+            def iter_content(self, chunk_size):
+                if self.mode == "fail":
+                    yield b"partial-bytes-written-to-disk"
+                    raise requests.exceptions.ConnectionError("dropped mid-stream")
+                yield zip_bytes
+        def fake_get(url, **kwargs):
+            state["calls"] += 1
+            return _FlakyResp("fail" if state["calls"] == 1 else "ok")
+        monkeypatch.setattr(ingest_data.requests, "get", fake_get)
+        zip_path, computed = ingest_data.download_zip(
+            tmp_path, "aggTrades", "BTCUSDT", "2024-01-01"
+        )
+        assert state["calls"] == 2 
+        assert zip_path is not None and zip_path.exists()
+        assert computed == hashlib.sha256(zip_bytes).hexdigest()
+
+    def test_partial_zip_deleted_when_all_retries_exhausted(self, tmp_path, monkeypatch):
+        class _AlwaysFails:
+            status_code = 200
+            def raise_for_status(self):
+                pass
+            def iter_content(self, chunk_size):
+                yield b"partial"
+                raise requests.exceptions.ConnectionError("always fails")
+        monkeypatch.setattr(ingest_data.requests, "get", lambda url, **kw: _AlwaysFails())
+        with pytest.raises(requests.exceptions.RequestException):
+            ingest_data.download_zip(tmp_path, "aggTrades", "BTCUSDT", "2024-01-01")
+        zip_path = tmp_path / "BTCUSDT" / "aggTrades" / "BTCUSDT-aggTrades-2024-01-01.zip"
+        assert not zip_path.exists()
+
 
 # integration tests with mocked network
 class TestProcessTask:
@@ -392,7 +487,7 @@ class TestProcessTask:
     def test_skips_already_existing_csv(self, tmp_path, requests_mock):
         csv_dir = tmp_path / "BTCUSDT" / "aggTrades"
         csv_dir.mkdir(parents=True)
-        (csv_dir / "BTCUSDT-aggTrades-2024-01-01.csv").touch()
+        (csv_dir / "BTCUSDT-aggTrades-2024-01-01.csv").write_text(VALID_AGGTRADES_CSV)
         result = ingest_data.process_task(tmp_path, "aggTrades", "BTCUSDT", "2024-01-01")
         assert result["status"] == "skipped"
         assert not requests_mock.called

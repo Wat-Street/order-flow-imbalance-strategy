@@ -49,6 +49,8 @@ logger = logging.getLogger("root_logger")
 url = "https://data.binance.vision/data/futures/um/daily"
 symbol_list = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 types = ["bookTicker", "aggTrades", "klines"]
+REQUEST_TIMEOUT = (10, 300)
+MIN_CSV_SIZE = 100
 
 
 # step 1, define CLI arguments and validate them
@@ -118,12 +120,25 @@ def check_task_exists(data_dir, data_type, symbol, date_str):
     base = Path(data_dir)
     if data_type == "klines":
         kline_path = base / symbol / "klines" / f"{symbol}-1m-{date_str}.csv"
-        if kline_path.exists():
+        if kline_path.exists() and kline_path.stat().st_size >= MIN_CSV_SIZE:
             return True
+        if kline_path.exists():
+            logger.debug(
+                "Stale/undersized CSV, will re-download: path=%s size=%s bytes",
+                kline_path,
+                kline_path.stat().st_size,
+            )
     else:
         file_path = base / symbol / data_type / f"{symbol}-{data_type}-{date_str}.csv"
-        if file_path.exists():
+        if file_path.exists() and file_path.stat().st_size >= MIN_CSV_SIZE:
             return True
+        if file_path.exists():
+            logger.debug(
+                "Stale/undersized CSV, will re-download: path=%s size=%s bytes",
+                file_path,
+                file_path.stat().st_size,
+            )
+
     return False
 
 
@@ -137,7 +152,7 @@ def download_checksum(data_dir, data_type, symbol, date_str):
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
             time.sleep(0.1)  # Added rate-limiting cushion before network call
-            response = requests.get(path_url)
+            response = requests.get(path_url, timeout=REQUEST_TIMEOUT)
             if response.status_code == 404:
                 logger.info(
                     "Checksum file not found (404): symbol=%s type=%s date=%s",
@@ -200,7 +215,7 @@ def download_zip(data_dir, data_type, symbol, date_str):
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             time.sleep(0.1)  # Added rate-limiting cushion before network call
-            response = requests.get(zip_url, stream=True)
+            response = requests.get(zip_url, stream=True, timeout=REQUEST_TIMEOUT)
             if response.status_code == 404:
                 logger.info(
                     "Zip file not found (404): symbol=%s type=%s date=%s",
@@ -210,8 +225,16 @@ def download_zip(data_dir, data_type, symbol, date_str):
                 )
                 return None, None
             response.raise_for_status()
+            sha256_hash = hashlib.sha256()
+            with open(zip_path, "wb") as f:
+                for chunk in response.iter_content(chunk_size=8 * 1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+                        sha256_hash.update(chunk)
             break
         except requests.HTTPError:
+            if zip_path.exists():
+                zip_path.unlink()
             if attempt == MAX_RETRIES:
                 logger.exception(
                     "Zip download failed after retries: symbol=%s type=%s date=%s",
@@ -229,6 +252,8 @@ def download_zip(data_dir, data_type, symbol, date_str):
             )
             time.sleep(2**attempt)
         except requests.RequestException:
+            if zip_path.exists():
+                zip_path.unlink()
             if attempt == MAX_RETRIES:
                 logger.exception(
                     "Zip download failed after retries: symbol=%s type=%s date=%s",
@@ -245,13 +270,6 @@ def download_zip(data_dir, data_type, symbol, date_str):
                 attempt,
             )
             time.sleep(2**attempt)
-
-    sha256_hash = hashlib.sha256()
-    with open(zip_path, "wb") as f:
-        for chunk in response.iter_content(chunk_size=8 * 1024 * 1024):
-            if chunk:
-                f.write(chunk)
-                sha256_hash.update(chunk)
 
     logger.info(
         "Zip downloaded successfully: path=%s size=%.2f MB",
