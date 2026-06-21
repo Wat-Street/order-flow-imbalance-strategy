@@ -299,14 +299,18 @@ class TestDownloadChecksumUnit:
 
     def test_passes_request_timeout(self, monkeypatch):
         captured = {}
+
         class _Resp:
             status_code = 200
             text = "deadbeef  BTCUSDT-aggTrades-2024-01-01.zip\n"
+
             def raise_for_status(self):
                 pass
+
         def fake_get(url, **kwargs):
             captured.update(kwargs)
             return _Resp()
+
         monkeypatch.setattr(ingest_data.requests, "get", fake_get)
         ingest_data.download_checksum(Path("dummy"), "aggTrades", "BTCUSDT", "2024-01-01")
         assert captured.get("timeout") == ingest_data.REQUEST_TIMEOUT
@@ -382,15 +386,20 @@ class TestDownloadZipUnit:
     def test_passes_request_timeout_and_stream(self, tmp_path, monkeypatch):
         zip_bytes = self._make_zip_bytes()
         captured = {}
+
         class _Resp:
             status_code = 200
+
             def raise_for_status(self):
                 pass
+
             def iter_content(self, chunk_size):
                 yield zip_bytes
+
         def fake_get(url, **kwargs):
             captured.update(kwargs)
             return _Resp()
+
         monkeypatch.setattr(ingest_data.requests, "get", fake_get)
         ingest_data.download_zip(tmp_path, "aggTrades", "BTCUSDT", "2024-01-01")
         assert captured.get("timeout") == ingest_data.REQUEST_TIMEOUT
@@ -402,35 +411,42 @@ class TestDownloadZipUnit:
 
         class _FlakyResp:
             status_code = 200
+
             def __init__(self, mode):
                 self.mode = mode
 
             def raise_for_status(self):
                 pass
+
             def iter_content(self, chunk_size):
                 if self.mode == "fail":
                     yield b"partial-bytes-written-to-disk"
                     raise requests.exceptions.ConnectionError("dropped mid-stream")
                 yield zip_bytes
+
         def fake_get(url, **kwargs):
             state["calls"] += 1
             return _FlakyResp("fail" if state["calls"] == 1 else "ok")
+
         monkeypatch.setattr(ingest_data.requests, "get", fake_get)
         zip_path, computed = ingest_data.download_zip(
             tmp_path, "aggTrades", "BTCUSDT", "2024-01-01"
         )
-        assert state["calls"] == 2 
+        assert state["calls"] == 2
         assert zip_path is not None and zip_path.exists()
         assert computed == hashlib.sha256(zip_bytes).hexdigest()
 
     def test_partial_zip_deleted_when_all_retries_exhausted(self, tmp_path, monkeypatch):
         class _AlwaysFails:
             status_code = 200
+
             def raise_for_status(self):
                 pass
+
             def iter_content(self, chunk_size):
                 yield b"partial"
                 raise requests.exceptions.ConnectionError("always fails")
+
         monkeypatch.setattr(ingest_data.requests, "get", lambda url, **kw: _AlwaysFails())
         with pytest.raises(requests.exceptions.RequestException):
             ingest_data.download_zip(tmp_path, "aggTrades", "BTCUSDT", "2024-01-01")
