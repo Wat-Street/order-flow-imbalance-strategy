@@ -12,6 +12,7 @@ dependencies = [
     "requests>=2.30",
     "tqdm>=4.65",
     "pandas",
+    "polars",
 ]
 
 [project.optional-dependencies]
