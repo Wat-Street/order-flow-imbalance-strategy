@@ -60,15 +60,29 @@ def compute_ofi(df: pl.DataFrame) -> pl.DataFrame:
     if missing:
         raise ValueError(f"input frame missing required columns: {missing}")
 
+    # An aligned input must not already carry the output columns; if it does
+    # (e.g. a signal frame fed back in by mistake) the final ``select`` would
+    # project them twice and raise an opaque DuplicateError. Fail loudly and
+    # early instead, so the upstream mistake is obvious rather than hidden.
+    conflicting = [c for c in OUTPUT_COLUMNS if c in df.columns]
+    if conflicting:
+        raise ValueError(f"input frame already contains output columns: {conflicting}")
+
     original_columns = df.columns
     df = df.sort("timestamp")
 
     # ``book_stale`` is part of the aligned spec; default to "not stale" if a
-    # test frame omits it so the rest of the logic stays uniform.
+    # test frame omits it so the rest of the logic stays uniform. Compute the
+    # t-1 flag explicitly: ``pl.lit(False).shift(1)`` yields all-null (a literal
+    # has no length to shift), which ``fill_null(True)`` below would then treat
+    # as stale and null *every* output. When the column is absent, t-1 is simply
+    # "not stale" too.
     if "book_stale" in df.columns:
         book_stale = pl.col("book_stale")
+        book_stale_prev = pl.col("book_stale").shift(1)
     else:
         book_stale = pl.lit(False)  # noqa: FBT003 - boolean literal is intentional
+        book_stale_prev = pl.lit(False)  # noqa: FBT003 - boolean literal is intentional
 
     df = df.with_columns(
         pl.col("bid_price").shift(1).alias("prev_bid_price"),
@@ -76,7 +90,7 @@ def compute_ofi(df: pl.DataFrame) -> pl.DataFrame:
         pl.col("bid_qty").shift(1).alias("prev_bid_qty"),
         pl.col("ask_qty").shift(1).alias("prev_ask_qty"),
         book_stale.alias("_book_stale"),
-        book_stale.shift(1).alias("_book_stale_prev"),
+        book_stale_prev.alias("_book_stale_prev"),
     )
 
     # Bid contribution e_b, piecewise on the best-bid price move.
@@ -305,7 +319,11 @@ def main(argv: list[str] | None = None) -> int:
                 mean_ofi = result.get("mean_ofi")
                 std_ofi = result.get("std_ofi")
                 # Flag a suspicious persistent drift: |mean| large vs spread.
-                if mean_ofi is not None and std_ofi and std_ofi > 0:
+                # ``mean``/``std`` are None for an all-null day (guard explicitly
+                # rather than by falsiness). The drift metric is measured relative
+                # to ``std``, so it is undefined when ``std == 0`` (a constant OFI):
+                # ``> 0`` deliberately skips that degenerate day.
+                if mean_ofi is not None and std_ofi is not None and std_ofi > 0:
                     if abs(mean_ofi) > 0.1 * std_ofi:
                         drift_warnings.append(
                             f"{result['symbol']} {result['date']}: "

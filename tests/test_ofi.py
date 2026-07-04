@@ -233,6 +233,19 @@ def test_missing_required_column_raises():
         compute_ofi(df)
 
 
+# Case 13b: Input already carrying an output column (e.g. a rerun/fed-back
+# signal frame) => ValueError, not an opaque DuplicateError from select().
+def test_input_with_existing_output_column_raises():
+    df = make_frame(
+        [
+            {"bid_price": 100.0, "ask_price": 101.0, "bid_qty": 3.0, "ask_qty": 4.0},
+            {"bid_price": 100.5, "ask_price": 101.0, "bid_qty": 5.0, "ask_qty": 4.0},
+        ]
+    ).with_columns(pl.lit(0.0).alias("ofi_1s"))
+    with pytest.raises(ValueError, match="already contains output columns"):
+        compute_ofi(df)
+
+
 # --- worker / IO ------------------------------------------------------------
 
 
@@ -399,6 +412,28 @@ def test_crossed_book_nulls_ofi():
     out = compute_ofi(df)
     assert out["ofi_1s"][1] is None  # crossed/locked current book
     assert out["ofi_1s"][2] is None  # previous book was crossed/locked
+
+
+# Case 21b: Frame omitting book_stale falls back to "not stale" (not all-null).
+# ``pl.lit(False).shift(1)`` is all-null; a naive fallback would treat every
+# t-1 as stale and null the whole output. The fallback must compute OFI normally.
+def test_missing_book_stale_column_falls_back_to_not_stale():
+    df = pl.DataFrame(
+        {
+            "timestamp": [T0, T0 + timedelta(seconds=1)],
+            "bid_price": [100.0, 100.5],
+            "ask_price": [101.0, 101.0],
+            "bid_qty": [3.0, 5.0],
+            "ask_qty": [4.0, 4.0],
+        }
+    )
+    assert "book_stale" not in df.columns
+    out = compute_ofi(df)
+    # Row 0 is warmup; row 1 is the rising-bid case (+5) and MUST be non-null.
+    assert out["ofi_1s"][0] is None
+    assert out["ofi_1s"][1] == pytest.approx(5.0)
+    assert out["bid_contribution"][1] == pytest.approx(5.0)
+    assert out["ask_contribution"][1] == pytest.approx(0.0)
 
 
 # --- CLI (merged into the ofi module) --------------------------------------
