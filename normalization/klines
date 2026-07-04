@@ -1,0 +1,303 @@
+import argparse
+import json
+import logging
+import os
+from concurrent.futures import ProcessPoolExecutor
+from datetime import date, datetime, timedelta
+from pathlib import Path
+
+import polars as pl
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] (%(processName)s) %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("KlinesNormalizer")
+
+# Annualisation factor for 1-minute bars: sqrt(60 * 24 * 365)
+ANNUALISATION_FACTOR = (60 * 24 * 365) ** 0.5
+REALIZED_VOL_WINDOW = 20
+ATR_WINDOW = 14
+LOOKBACK_BARS = max(REALIZED_VOL_WINDOW, ATR_WINDOW) + 1
+MIN_OUTPUT_ROWS = 100
+MIN_PARQUET_BYTES = 512
+THRESHOLDS_PATH = "configs/vol_regime_thresholds.json"
+
+OUTPUT_COLUMNS = (
+    "timestamp",
+    "asset",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "log_return",
+    "realized_vol",
+    "ATR",
+    "vol_regime",
+)
+
+
+def load_thresholds(thresholds_path: str = THRESHOLDS_PATH) -> dict | None:
+    """Load vol-regime thresholds if present; otherwise leave vol_regime null."""
+    path = Path(thresholds_path)
+    if not path.exists():
+        return None
+    with path.open() as f:
+        return json.load(f)
+
+
+def output_is_complete(output_file: Path) -> bool:
+    return output_file.exists() and output_file.stat().st_size >= MIN_PARQUET_BYTES
+
+
+def generate_tasks(symbols, start_date, end_date, raw_dir, processed_dir):
+    tasks = []
+    current_date = start_date
+    while current_date <= end_date:
+        date_str = current_date.strftime("%Y-%m-%d")
+        for symbol in symbols:
+            raw_file = Path(raw_dir) / symbol / "klines" / f"{symbol}-1m-{date_str}.csv"
+            output_dir = Path(processed_dir) / symbol / "klines"
+            output_file = output_dir / f"{symbol}-klines-{date_str}.parquet"
+
+            if output_is_complete(output_file):
+                continue
+            if not raw_file.exists():
+                continue
+
+            tasks.append(
+                {
+                    "symbol": symbol,
+                    "date_str": date_str,
+                    "keep_date": current_date.date().isoformat(),
+                    "raw_path": str(raw_file),
+                    "output_path": str(output_file),
+                    "output_dir": str(output_dir),
+                    "raw_dir": str(raw_dir),
+                }
+            )
+        current_date += timedelta(days=1)
+    return tasks
+
+
+def scan_klines_csv(raw_path: str | Path) -> pl.LazyFrame:
+    """Binance klines CSVs from ingest include a header row."""
+    return pl.scan_csv(raw_path, has_header=True, rechunk=False)
+
+
+def load_day_with_context(raw_path: Path, raw_dir: Path, symbol: str, day: date) -> pl.LazyFrame:
+    """Prepend the prior day's tail so rolling features do not reset at day boundaries."""
+    current = scan_klines_csv(raw_path)
+    prev_path = (
+        raw_dir / symbol / "klines" / f"{symbol}-1m-{(day - timedelta(days=1)):%Y-%m-%d}.csv"
+    )
+    if not prev_path.exists():
+        return current
+
+    prev_tail = scan_klines_csv(prev_path).collect().tail(LOOKBACK_BARS)
+    if prev_tail.is_empty():
+        return current
+
+    return pl.concat([prev_tail.lazy(), current], how="vertical")
+
+
+def process_klines(
+    lf: pl.LazyFrame,
+    symbol: str,
+    thresholds: dict | None,
+    keep_date: date,
+) -> pl.LazyFrame:
+    lf = lf.with_columns(
+        [
+            pl.col("open_time").cast(pl.Int64).cast(pl.Datetime("ms")).alias("timestamp"),
+            pl.lit(symbol).alias("asset"),
+            pl.col("open").cast(pl.Float64),
+            pl.col("high").cast(pl.Float64),
+            pl.col("low").cast(pl.Float64),
+            pl.col("close").cast(pl.Float64),
+            pl.col("volume").cast(pl.Float64),
+        ]
+    )
+
+    lf = (
+        lf.filter(
+            (pl.col("open") > 0)
+            & (pl.col("high") > 0)
+            & (pl.col("low") > 0)
+            & (pl.col("close") > 0)
+            & (pl.col("volume") >= 0)
+            & (pl.col("high") >= pl.col("low"))
+            & (pl.col("high") >= pl.col("open"))
+            & (pl.col("high") >= pl.col("close"))
+            & (pl.col("low") <= pl.col("open"))
+            & (pl.col("low") <= pl.col("close"))
+        )
+        .unique(subset=["timestamp"], keep="last")
+        .sort("timestamp")
+    )
+
+    lf = lf.with_columns(
+        (pl.col("close") / pl.col("close").shift(1)).log().alias("log_return"),
+    )
+
+    lf = lf.with_columns(
+        (
+            pl.col("log_return").rolling_std(window_size=REALIZED_VOL_WINDOW, ddof=1)
+            * ANNUALISATION_FACTOR
+        ).alias("realized_vol"),
+    )
+
+    lf = lf.with_columns(
+        pl.max_horizontal(
+            pl.col("high") - pl.col("low"),
+            (pl.col("high") - pl.col("close").shift(1)).abs(),
+            (pl.col("low") - pl.col("close").shift(1)).abs(),
+        ).alias("true_range"),
+    )
+
+    lf = lf.with_columns(
+        pl.col("true_range").ewm_mean(span=ATR_WINDOW, adjust=False).alias("ATR"),
+    )
+
+    if thresholds and symbol in thresholds:
+        p25 = thresholds[symbol]["p25"]
+        p75 = thresholds[symbol]["p75"]
+        lf = lf.with_columns(
+            pl.when(pl.col("realized_vol") > p75)
+            .then(pl.lit("high"))
+            .when(pl.col("realized_vol") < p25)
+            .then(pl.lit("low"))
+            .when(pl.col("realized_vol").is_not_null())
+            .then(pl.lit("normal"))
+            .otherwise(pl.lit(None))
+            .alias("vol_regime"),
+        )
+    else:
+        lf = lf.with_columns(pl.lit(None).cast(pl.Utf8).alias("vol_regime"))
+
+    return lf.filter(pl.col("timestamp").dt.date() == keep_date).select(OUTPUT_COLUMNS)
+
+
+def execute_normalization(task):
+    raw_path = Path(task["raw_path"])
+    output_path = Path(task["output_path"])
+    output_dir = Path(task["output_dir"])
+    raw_dir = Path(task["raw_dir"])
+    symbol = task["symbol"]
+    date_str = task["date_str"]
+    keep_date = date.fromisoformat(task["keep_date"])
+    thresholds = task.get("thresholds")
+
+    try:
+        lf = load_day_with_context(raw_path, raw_dir, symbol, keep_date)
+        processed_lf = process_klines(lf, symbol, thresholds, keep_date)
+        df = processed_lf.collect(streaming=True)
+
+        if df.height < MIN_OUTPUT_ROWS:
+            logger.warning(
+                "SKIPPED [%s | klines | %s]: Only %s valid rows survived filters.",
+                symbol,
+                date_str,
+                df.height,
+            )
+            return
+
+        critical_cols = ["timestamp", "asset", "open", "high", "low", "close", "volume"]
+        for col in critical_cols:
+            assert df[col].null_count() == 0, f"Null values in critical column: {col}"
+
+        assert (
+            df.select(pl.col("open", "high", "low", "close").is_infinite()).sum_horizontal().item()
+            == 0
+        ), "Inf values in OHLC"
+        assert df["open"].min() > 0 and df["close"].min() > 0, "Prices must be positive"
+        assert df["high"].min() >= df["low"].min(), "high < low detected"
+        assert df["volume"].min() >= 0, "Negative volume detected"
+        assert list(df.columns) == list(OUTPUT_COLUMNS), (
+            f"Column mismatch. Expected {OUTPUT_COLUMNS}, got {df.columns}"
+        )
+
+        if thresholds and symbol in thresholds:
+            labeled = df["vol_regime"].drop_nulls().unique().to_list()
+            assert set(labeled) <= {"low", "normal", "high"}, (
+                f"Unexpected vol_regime values: {labeled}"
+            )
+
+        os.makedirs(output_dir, exist_ok=True)
+        df.write_parquet(output_path, compression="snappy")
+        logger.info(
+            "SUCCESS [%s | klines | %s]: Transformed %s records.",
+            symbol,
+            date_str,
+            df.height,
+        )
+
+    except Exception as exc:
+        logger.error(
+            "FAILED [%s | klines | %s]: Execution crashed with error: %s",
+            symbol,
+            date_str,
+            exc,
+        )
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Binance klines normalization pipeline.")
+    parser.add_argument(
+        "--symbols",
+        nargs="+",
+        required=True,
+        help="List of trading pairs (e.g., BTCUSDT ETHUSDT)",
+    )
+    parser.add_argument("--start", required=True, help="Processing window start date (YYYY-MM-DD)")
+    parser.add_argument("--end", required=True, help="Processing window end date (YYYY-MM-DD)")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=os.cpu_count(),
+        help="Total parallel processes to spin up",
+    )
+    parser.add_argument("--raw-dir", default="data/raw", help="Root directory for raw CSV files")
+    parser.add_argument(
+        "--processed-dir",
+        default="data/processed",
+        help="Root directory for processed parquet output",
+    )
+    parser.add_argument(
+        "--thresholds-path",
+        default=THRESHOLDS_PATH,
+        help="Optional JSON file with per-symbol vol regime thresholds",
+    )
+
+    args = parser.parse_args()
+
+    start_dt = datetime.strptime(args.start, "%Y-%m-%d")
+    end_dt = datetime.strptime(args.end, "%Y-%m-%d")
+    if end_dt < start_dt:
+        raise SystemExit("--end must be on or after --start")
+
+    thresholds = load_thresholds(args.thresholds_path)
+    tasks = generate_tasks(args.symbols, start_dt, end_dt, args.raw_dir, args.processed_dir)
+    for task in tasks:
+        task["thresholds"] = thresholds
+
+    if not tasks:
+        logger.info("All selected files are up to date. No new work needed.")
+        return
+
+    logger.info(
+        "Generated %s target normalization jobs. Executing across %s process workers...",
+        len(tasks),
+        args.workers,
+    )
+
+    with ProcessPoolExecutor(max_workers=args.workers) as executor:
+        executor.map(execute_normalization, tasks)
+
+    logger.info("Klines normalization pipeline execution has completed successfully.")
+
+
+if __name__ == "__main__":
+    main()

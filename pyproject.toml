@@ -31,10 +31,10 @@ pythonpath = ["src"]
 [tool.ruff]
 target-version = "py311"
 line-length = 100
-src = ["src", "tests"]
-
-[tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B"]
+src = ["src", "tests", "normalization"]
 
 [tool.ruff.format]
 quote-style = "double"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
