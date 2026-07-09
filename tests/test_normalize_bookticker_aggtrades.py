@@ -10,6 +10,7 @@ from order_flow_imbalance_strategy.normalize_data import (
     process_book_ticker,
 )
 
+
 @pytest.fixture
 def sample_book_ticker_lazyframe():
     """Generates a mock LazyFrame simulating raw bookTicker CSV input."""
