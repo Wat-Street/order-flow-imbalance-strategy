@@ -2,7 +2,8 @@ import argparse
 import json
 import logging
 import os
-from concurrent.futures import ProcessPoolExecutor
+import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -181,6 +182,8 @@ def process_klines(
 
 
 def execute_normalization(task):
+    """Normalize a single klines file. Returns True on success or intentional skip,
+    False if the job failed (so the caller can count failures)."""
     raw_path = Path(task["raw_path"])
     output_path = Path(task["output_path"])
     output_dir = Path(task["output_dir"])
@@ -193,7 +196,7 @@ def execute_normalization(task):
     try:
         lf = load_day_with_context(raw_path, raw_dir, symbol, keep_date)
         processed_lf = process_klines(lf, symbol, thresholds, keep_date)
-        df = processed_lf.collect(streaming=True)
+        df = processed_lf.collect(engine="streaming")
 
         if df.height < MIN_OUTPUT_ROWS:
             logger.warning(
@@ -202,16 +205,20 @@ def execute_normalization(task):
                 date_str,
                 df.height,
             )
-            return
+            return True
 
         critical_cols = ["timestamp", "asset", "open", "high", "low", "close", "volume"]
         for col in critical_cols:
             assert df[col].null_count() == 0, f"Null values in critical column: {col}"
 
-        assert (
-            df.select(pl.col("open", "high", "low", "close").is_infinite()).sum_horizontal().item()
-            == 0
-        ), "Inf values in OHLC"
+        # is_infinite/is_nan are element-wise, so aggregate per column before .item()
+        ohlc = df.select("open", "high", "low", "close")
+        assert ohlc.select(pl.all().is_infinite().sum()).sum_horizontal().item() == 0, (
+            "Inf values in OHLC"
+        )
+        assert ohlc.select(pl.all().is_nan().sum()).sum_horizontal().item() == 0, (
+            "NaN values in OHLC"
+        )
         assert df["open"].min() > 0 and df["close"].min() > 0, "Prices must be positive"
         assert df["high"].min() >= df["low"].min(), "high < low detected"
         assert df["volume"].min() >= 0, "Negative volume detected"
@@ -233,6 +240,7 @@ def execute_normalization(task):
             date_str,
             df.height,
         )
+        return True
 
     except Exception as exc:
         logger.error(
@@ -241,6 +249,7 @@ def execute_normalization(task):
             date_str,
             exc,
         )
+        return False
 
 
 def main():
@@ -293,8 +302,25 @@ def main():
         args.workers,
     )
 
+    failed_tasks = 0
     with ProcessPoolExecutor(max_workers=args.workers) as executor:
-        executor.map(execute_normalization, tasks)
+        future_to_task = {executor.submit(execute_normalization, task): task for task in tasks}
+        for future in as_completed(future_to_task):
+            task = future_to_task[future]
+            try:
+                succeeded = future.result()
+            except Exception as exc:
+                # worker died unexpectedly (e.g. crash/pickling), not caught inside the task
+                succeeded = False
+                logger.error(
+                    "Failed for symbol %s on %s: %s", task["symbol"], task["date_str"], exc
+                )
+            if not succeeded:
+                failed_tasks += 1
+
+    if failed_tasks > 0:
+        logger.error("Completed with %s failure(s). Exiting with error.", failed_tasks)
+        sys.exit(1)
 
     logger.info("Klines normalization pipeline execution has completed successfully.")
 
