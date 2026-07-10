@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import polars as pl
+import polars.selectors as cs
 
 # set up for logging
 logging.basicConfig(
@@ -15,6 +16,31 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("Normalizer")
+
+# --- Configuration constants -------------------------------------------------
+# Centralized here rather than scattered through the code. These describe the
+# Binance file schema (a fixed data contract, not user-tunable) and the default
+# on-disk layout (overridable per-run via CLI flags below).
+
+# Default data directories; override with --raw-dir / --processed-dir.
+DEFAULT_RAW_DIR = "data/raw"
+DEFAULT_PROCESSED_DIR = "data/processed"
+
+# Minimum rows that must survive filtering before a file is written.
+MIN_VALID_ROWS = 100
+
+# Binance ships bookTicker CSVs with descriptive headers; map them to our schema.
+# (update_id and event_time already match, so they are left untouched.)
+BOOK_TICKER_RENAME = {
+    "best_bid_price": "bid_price",
+    "best_bid_qty": "bid_qty",
+    "best_ask_price": "ask_price",
+    "best_ask_qty": "ask_qty",
+    "transaction_time": "transact_time",
+}
+# aggTrades headers (agg_trade_id, price, quantity, first_trade_id, last_trade_id,
+# transact_time, is_buyer_maker) already match our schema, so no rename is needed.
+# -----------------------------------------------------------------------------
 
 
 def generate_tasks(symbols, start_date, end_date, data_types, raw_dir, processed_dir):
@@ -52,18 +78,8 @@ def generate_tasks(symbols, start_date, end_date, data_types, raw_dir, processed
 
 # normalizes bookticker data
 def process_book_ticker(lf: pl.LazyFrame, symbol: str) -> pl.LazyFrame:
-    # rename columns
-    lf = lf.rename(
-        {
-            "column_1": "update_id",
-            "column_2": "bid_price",
-            "column_3": "bid_qty",
-            "column_4": "ask_price",
-            "column_5": "ask_qty",
-            "column_6": "transact_time",
-            "column_7": "event_time",
-        }
-    )
+    # rename raw Binance headers to our normalized schema
+    lf = lf.rename(BOOK_TICKER_RENAME)
     # convert data to correct types
     lf = lf.with_columns(
         [
@@ -110,17 +126,8 @@ def process_book_ticker(lf: pl.LazyFrame, symbol: str) -> pl.LazyFrame:
 
 # normalizes raw agg trades data
 def process_agg_trades(lf: pl.LazyFrame, symbol: str) -> pl.LazyFrame:
-    lf = lf.rename(
-        {
-            "column_1": "agg_trade_id",
-            "column_2": "price",
-            "column_3": "quantity",
-            "column_4": "first_trade_id",
-            "column_5": "last_trade_id",
-            "column_6": "transact_time",
-            "column_7": "is_buyer_maker",
-        }
-    )
+    # aggTrades headers already match our schema (see AGG_TRADES note above),
+    # so no rename is required.
 
     # converting data to right types and generating the directions column
     lf = lf.with_columns(
@@ -159,6 +166,8 @@ def process_agg_trades(lf: pl.LazyFrame, symbol: str) -> pl.LazyFrame:
 
 
 def execute_normalization(task):
+    """Normalize a single raw file. Returns True on success or intentional skip,
+    False if the job failed (so the caller can count failures)."""
     raw_path = task["raw_path"]
     output_path = task["output_path"]
     output_dir = task["output_dir"]
@@ -175,20 +184,26 @@ def execute_normalization(task):
         elif data_type == "aggTrades":
             processed_lf = process_agg_trades(lf, symbol)
         else:
-            return
-        # as suggested by docs, use this to optimize ram usage
-        df = processed_lf.collect(streaming=True)
-        # skip file if less than 100 rows survive filtering
-        if df.height < 100:
+            logger.warning(f"SKIPPED [{symbol} | {data_type} | {date_str}]: unknown data type.")
+            return True
+        # stream the collection to keep peak RAM down on large files
+        df = processed_lf.collect(engine="streaming")
+        # skip file if fewer than the minimum rows survive filtering
+        if df.height < MIN_VALID_ROWS:
             logger.warning(
                 f"SKIPPED [{symbol} | {data_type} | {date_str}]: "
                 f"Only {df.height} valid rows survived filters."
             )
-            return
+            return True
 
         # assertions to check that data has been correctly normalized
         assert df.select(pl.all().null_count()).sum_horizontal().item() == 0, "Null values"
-        assert df.select(pl.all().is_infinite()).sum_horizontal().item() == 0, "Inf/NaN values"
+        # inf/NaN checks only apply to float columns (datetime/str/int don't support them)
+        float_cols = df.select(cs.float())
+        inf_count = float_cols.select(pl.all().is_infinite().sum()).sum_horizontal().item()
+        nan_count = float_cols.select(pl.all().is_nan().sum()).sum_horizontal().item()
+        assert inf_count == 0, "Inf values"
+        assert nan_count == 0, "NaN values"
         if data_type == "bookTicker":
             assert df["spread"].min() >= 0, "Negative spread"
             assert df["bid_price"].min() > 0 and df["ask_price"].min() > 0, (
@@ -207,11 +222,13 @@ def execute_normalization(task):
         logger.info(
             f"SUCCESS [{symbol} | {data_type} | {date_str}]: Transformed {df.height} records."
         )
+        return True
 
     except Exception as e:
         logger.error(
             f"FAILED [{symbol} | {data_type} | {date_str}]: Execution crashed with error: {str(e)}"
         )
+        return False
 
 
 def main():
@@ -233,19 +250,25 @@ def main():
     parser.add_argument(
         "--workers", type=int, default=os.cpu_count(), help="Total parallel processes to spin up"
     )
+    parser.add_argument(
+        "--raw-dir", default=DEFAULT_RAW_DIR, help="Root directory of raw input CSVs"
+    )
+    parser.add_argument(
+        "--processed-dir",
+        default=DEFAULT_PROCESSED_DIR,
+        help="Root directory for normalized parquet output",
+    )
 
     args = parser.parse_args()
-
-    # data directories, change as needed
-    raw_dir = "data/raw"
-    processed_dir = "data/processed"
 
     # date validation
     start_dt = datetime.strptime(args.start, "%Y-%m-%d")
     end_dt = datetime.strptime(args.end, "%Y-%m-%d")
 
     logger.info("Initializing task parameters and pipeline states...")
-    tasks = generate_tasks(args.symbols, start_dt, end_dt, args.types, raw_dir, processed_dir)
+    tasks = generate_tasks(
+        args.symbols, start_dt, end_dt, args.types, args.raw_dir, args.processed_dir
+    )
 
     if not tasks:
         logger.info("All selected files are up to date. No new work needed.")
@@ -264,10 +287,13 @@ def main():
         for future in as_completed(future_to_task):
             task = future_to_task[future]
             try:
-                future.result()
+                succeeded = future.result()
             except Exception as e:
-                failed_tasks += 1
+                # worker died unexpectedly (e.g. crash/pickling), not caught inside the task
+                succeeded = False
                 logger.error(f"Failed for symbol {task['symbol']} on {task['date_str']}: {e}")
+            if not succeeded:
+                failed_tasks += 1
 
     # exit with error message if any tasks failed
     if failed_tasks > 0:
