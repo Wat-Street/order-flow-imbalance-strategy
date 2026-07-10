@@ -5,7 +5,7 @@ from pathlib import Path
 import concurrent.futures
 
 import polars as pl 
-import tqdm
+from tqdm import tqdm
 
 # define constants
 symbol_list = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
@@ -26,8 +26,15 @@ def generate_tasks(args):
 
 # Step 4 - match trades to price using asof join with polars
 def match_trades_to_price(symbol, date_str):
-    trades = pl.scan_parquet(f"DATA_PROCESSED_DIR/{symbol}/aggTrades/{symbol}-aggTrades-{date_str}.parquet")
-    prices = pl.scan_parquet(f"DATA_PROCESSED_DIR/{symbol}/bookTicker/{symbol}-bookTicker-{date_str}.parquet")
+    trades_path = DATA_PROCESSED_DIR/f"{symbol}/aggTrades/{symbol}-aggTrades-{date_str}.parquet"
+    prices_path = DATA_PROCESSED_DIR/f"{symbol}/bookTicker/{symbol}-bookTicker-{date_str}.parquet"
+
+    if not trades_path.exists() or not prices_path.exists():
+        print(f"Missing file for {symbol} on {date_str}. Skipping.")
+        return
+
+    trades = pl.scan_parquet(trades_path)
+    prices = pl.scan_parquet(prices_path)
 
     trades = trades.sort("transact_time")
     prices = prices.sort("transaction_time")
@@ -38,6 +45,32 @@ def match_trades_to_price(symbol, date_str):
     return matched_data
 
 # Step 5 - calculate suspicion clues
+
+# Zero Price-Impact
+def zero_price_impact(df, impact_eps):
+    # calculate price impact as the difference between the mid-price of the current trade and the next trade
+    mid = (pl.col("best_bid_price") + pl.col("best_ask_price")) / 2
+
+    df = df.with_columns(
+        mid.alias("mid-price"),
+        mid.shift(-1).alias("next_mid-price"),
+    ) 
+
+    df = df.sort("transact_time").with_columns([
+        pl.col("quantity").rolling_quantile(window_size=500, quantile=0.9).alias("size_baseline")
+    ])
+
+    large_trade = pl.col("quantity") > pl.col("size_baseline")
+    price_change = (pl.col("next_mid-price") - pl.col("mid-price")).abs()
+
+    # calculate score for price impact
+    score = (pl.when(large_trade & (price_change < impact_eps)).then(1).then((impact_eps - price_change) / impact_eps).otherwise(0))
+    
+    return df.select(score.alias("zero_price_impact_score")).to_series()
+
+
+
+# process each file
 def process_task(symbol, date_str):
     matched_data = match_trades_to_price(symbol, date_str)
 
@@ -64,11 +97,9 @@ def main():
 
     tasks = generate_tasks(args)
 
-    ######### up to here is in order ##########
-
-    # submit tasks to ThreadPoolExecutor to download tasks in parallel
-    results = {"ok": 0, "skipped": 0, "missing": 0, "checksum_failed": 0, "error": 0}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
+    # submit tasks to ProcessPoolExecutor to perform wash trade filtering in parallel
+    # results = {"ok": 0, "skipped": 0, "missing": 0, "checksum_failed": 0, "error": 0}
+    with concurrent.futures.ProcessPoolExecutor(max_workers=args.workers) as executor:
         futures = [
             executor.submit(process_task, symbol, date_str)
             for symbol, date_str in tasks
@@ -78,8 +109,9 @@ def main():
             concurrent.futures.as_completed(futures), total=len(futures), desc="Wash Trade Filtering"
         ):
             result = future.result()
-            status = result["status"]
-            results[status] += 1
-        logger.info("Download process complete. Summary: %s", results)
-    if args.validate:
-        run_validation(data_dir, args)
+            # status = result["status"]
+            # results[status] += 1
+        
+
+if __name__ == "__main__":
+    main()
