@@ -341,16 +341,12 @@ def process_task(
         .otherwise(pl.lit("size_cluster_score"))
         .alias("wash_reason")
 
-    ).with_columns(
         # cleaned-flow columns (buy_qty_clean, sell_qty_clean, notional_clean) 
         # suspected prints are zeroed 
-        pl.when(pl.col("wash_suspect")).then(
-            ((1.0 - pl.col("wash_score")) / (1.0 - wash_score_cut)).clip(lower_bound=0.0, upper_bound=1.0)
-        ).otherwise(1.0).alias("clean_weight")
     ).with_columns([
-        (pl.col("buy_qty") * pl.col("clean_weight")).alias("buy_qty_clean"),
-        (pl.col("sell_qty") * pl.col("clean_weight")).alias("sell_qty_clean"),
-        (pl.col("notional") * pl.col("clean_weight")).alias("notional_clean"),
+        pl.when(pl.col("wash_suspect")).then(0.0).otherwise(pl.col("buy_qty")).alias("buy_qty_clean"),
+        pl.when(pl.col("wash_suspect")).then(0.0).otherwise(pl.col("sell_qty")).alias("sell_qty_clean"),
+        pl.when(pl.col("wash_suspect")).then(0.0).otherwise(pl.col("notional")).alias("notional_clean"),
     ])
 
     reason_counts = (
