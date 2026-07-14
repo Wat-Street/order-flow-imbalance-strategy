@@ -290,15 +290,23 @@ def process_task(
     wash_score_cut,
     passthrough,
 ):
+    out_dir = DATA_PROCESSED_DIR / symbol / "aggTrades_filtered"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{symbol}-aggTrades-{date_str}.parquet"
+
+    # Checking if the output file already exists so failed runs can be restarted
+    # is commented out because we may still want to rerun with different parameters
+    # on the same files for testing/tuning purposes
+    
+    #if out_path.exists():
+    #    logger.info("Skipping %s on %s because output file already exists.", symbol, date_str)
+    #    return {"symbol": symbol, "date": date_str, "status": "skipped_existing"}
+    
     matched_data = match_trades_to_price(symbol, date_str)
 
     # skip if file is smaller than MIN_CSV_SIZE or if the parquet file is missing
     if matched_data is None:
         return {"symbol": symbol, "date": date_str, "status": "missing"}
-
-    out_dir = DATA_PROCESSED_DIR / symbol / "aggTrades_filtered"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"{symbol}-aggTrades-{date_str}.parquet"
 
     if passthrough:
         matched_data.write_parquet(out_path)
@@ -323,6 +331,7 @@ def process_task(
         size_clustering(matched_data, size_quantile).alias("size_cluster_score"),
     ]).with_columns(
         pl.max_horizontal(score_cols).alias("wash_score")
+
     ).with_columns(
         (pl.col("wash_score") >= wash_score_cut).alias("wash_suspect"),
         pl.when(pl.col("impact_score") == pl.col("wash_score")).then(pl.lit("impact_score"))
@@ -331,7 +340,18 @@ def process_task(
         .when(pl.col("duplicate_score") == pl.col("wash_score")).then(pl.lit("duplicate_score"))
         .otherwise(pl.lit("size_cluster_score"))
         .alias("wash_reason")
-    )
+
+    ).with_columns(
+        # cleaned-flow columns (buy_qty_clean, sell_qty_clean, notional_clean) 
+        # suspected prints are zeroed 
+        pl.when(pl.col("wash_suspect")).then(
+            ((1.0 - pl.col("wash_score")) / (1.0 - wash_score_cut)).clip(lower_bound=0.0, upper_bound=1.0)
+        ).otherwise(1.0).alias("clean_weight")
+    ).with_columns([
+        (pl.col("buy_qty") * pl.col("clean_weight")).alias("buy_qty_clean"),
+        (pl.col("sell_qty") * pl.col("clean_weight")).alias("sell_qty_clean"),
+        (pl.col("notional") * pl.col("clean_weight")).alias("notional_clean"),
+    ])
 
     reason_counts = (
         scored.filter(pl.col("wash_suspect"))
@@ -346,10 +366,13 @@ def process_task(
         for row in reason_counts.to_dicts()
     }
 
-    clean_volume = scored.filter(~pl.col("wash_suspect"))["quantity"].sum()
-    assert clean_volume <= matched_data["quantity"].sum()
+    clean_volume = scored["buy_qty_clean"].sum() + scored["sell_qty_clean"].sum()
+    assert clean_volume <= (matched_data["buy_qty"].sum() + matched_data["sell_qty"].sum())
 
     flag_rate = scored["wash_suspect"].mean()
+    if flag_rate > 0.15:
+        logger.warning("Flag rate (%.3f) is greater than 0.15 for %s on %s; filtering may be too sensitive", flag_rate, symbol, date_str)
+    
     scored.write_parquet(out_path)
 
     logger.info(
@@ -404,7 +427,7 @@ def main():
         sys.exit("start date must be before end date")
 
     tasks = generate_tasks(args)
-    results = {"ok": 0, "passthrough": 0, "missing": 0}
+    results = {"ok": 0, "passthrough": 0, "missing": 0, "skipped_existing": 0}
     total_flagged = 0
 
     logger.info("Generated %s wash-trade tasks for %s symbol(s) from %s to %s.", len(tasks), len(args.symbols), args.start,args.end)
