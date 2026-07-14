@@ -3,9 +3,45 @@ import concurrent.futures
 import datetime as dt
 import sys
 from pathlib import Path
+import logging
+import logging.config
 
 import polars as pl
 from tqdm import tqdm
+
+# set up logging for progress tracking and post-run inspection
+LOG_CONFIG = {
+    "version": 1,
+    "formatters": {
+        "standard": {"format": "%(asctime)s - %(levelname)s - %(message)s"}
+    },
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "level": "INFO",
+            "stream": "ext://sys.stdout",
+            "formatter": "standard",
+        },
+        "file": {
+            "class": "logging.FileHandler",
+            "filename": "logs/filter_wash_trades.log",
+            "level": "DEBUG",
+            "mode": "a",
+            "formatter": "standard",
+        },
+    },
+    "loggers": {
+        "wash_trade_filter_logger": {
+            "handlers": ["console", "file"],
+            "level": "DEBUG",
+            "propagate": False,
+        }
+    },
+}
+
+Path("logs").mkdir(exist_ok=True)
+logging.config.dictConfig(LOG_CONFIG)
+logger = logging.getLogger("wash_trade_filter_logger")
 
 # define constants
 symbol_list = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
@@ -32,7 +68,7 @@ def match_trades_to_price(symbol, date_str):
     prices_path = DATA_PROCESSED_DIR / f"{symbol}/bookTicker/{symbol}-bookTicker-{date_str}.parquet"
 
     if not trades_path.exists() or not prices_path.exists():
-        print(f"Missing file for {symbol} on {date_str}. Skipping.")
+        logger.warning("Missing input file(s) for %s on %s. Skipping.", symbol, date_str)
         return
 
     trades = pl.scan_parquet(trades_path)
@@ -55,6 +91,7 @@ def match_trades_to_price(symbol, date_str):
     )
 
     if matched_data.height < MIN_CSV_SIZE:
+        logger.info("Skipping %s on %s because file has only %s rows rows.", symbol,date_str, matched_data.height)
         return None
 
     # return a polars dataframe with the matched data
@@ -265,6 +302,7 @@ def process_task(
 
     if passthrough:
         matched_data.write_parquet(out_path)
+        logger.info("Passthrough wrote %s on %s with %s rows.", symbol, date_str, matched_data.height)
         return {
             "symbol": symbol,
             "date": date_str,
@@ -275,43 +313,31 @@ def process_task(
     # all the scoring functions assume that the data is sorted by timestamp
     matched_data = matched_data.sort("timestamp", maintain_order=True)
 
-    scored = (
-        matched_data.with_columns(
-            [
-                zero_price_impact(matched_data, impact_eps, size_quantile, impact_horizon).alias(
-                    "impact_score"
-                ),
-                off_touch_execution(matched_data, touch_floor_bps).alias("touch_score"),
-                ping_pong_reversal(matched_data, pingpong_window).alias("ping_pong_score"),
-                duplicate_prints(matched_data).alias("duplicate_score"),
-                size_clustering(matched_data, size_quantile).alias("size_cluster_score"),
-            ]
-        )
-        .with_columns(
-            # final wash score is the maximum of all the individual scores
-            pl.max_horizontal(
-                [
-                    "impact_score",
-                    "touch_score",
-                    "ping_pong_score",
-                    "duplicate_score",
-                    "size_cluster_score",
-                ]
-            ).alias("wash_score")
-        )
-        .with_columns((pl.col("wash_score") >= wash_score_cut).alias("wash_suspect"))
+    score_cols = ["impact_score", "touch_score", "ping_pong_score", "duplicate_score", "size_cluster_score"]
+
+    scored = matched_data.with_columns([
+        zero_price_impact(matched_data, impact_eps, size_quantile, impact_horizon).alias("impact_score"),
+        off_touch_execution(matched_data, touch_floor_bps).alias("touch_score"),
+        ping_pong_reversal(matched_data, pingpong_window).alias("ping_pong_score"),
+        duplicate_prints(matched_data).alias("duplicate_score"),
+        size_clustering(matched_data, size_quantile).alias("size_cluster_score"),
+    ]).with_columns(
+        pl.max_horizontal(score_cols).alias("wash_score")
+    ).with_columns(
+        (pl.col("wash_score") >= wash_score_cut).alias("wash_suspect"),
+        pl.when(pl.col("impact_score") == pl.col("wash_score")).then(pl.lit("impact_score"))
+        .when(pl.col("touch_score") == pl.col("wash_score")).then(pl.lit("touch_score"))
+        .when(pl.col("ping_pong_score") == pl.col("wash_score")).then(pl.lit("ping_pong_score"))
+        .when(pl.col("duplicate_score") == pl.col("wash_score")).then(pl.lit("duplicate_score"))
+        .otherwise(pl.lit("size_cluster_score"))
+        .alias("wash_reason")
     )
-
-
-    # track the reason for wash suspicion 
 
     reason_counts = (
         scored.filter(pl.col("wash_suspect"))
         .group_by("wash_reason")
         .agg(pl.len().alias("count"))
-        .with_columns(
-            (pl.col("count") / pl.col("count").sum() * 100).alias("pct")
-        )
+        .with_columns((pl.col("count") / pl.col("count").sum() * 100).alias("pct"))
         .sort("count", descending=True)
     )
 
@@ -320,26 +346,24 @@ def process_task(
         for row in reason_counts.to_dicts()
     }
 
-
     clean_volume = scored.filter(~pl.col("wash_suspect"))["quantity"].sum()
     assert clean_volume <= matched_data["quantity"].sum()
 
     flag_rate = scored["wash_suspect"].mean()
-
     scored.write_parquet(out_path)
 
-    print(flag_rate)
-    print(reason_breakdown)
+    logger.info(
+        "Completed %s on %s: rows=%s flagged=%s flag_rate=%.3f reason_breakdown=%s",
+        symbol, date_str, scored.height, int(scored["wash_suspect"].sum()), flag_rate, reason_breakdown,
+    )
 
     return {
-        "symbol": symbol,
-        "date": date_str,
-        "status": "ok",
+        "symbol": symbol, "date": date_str, "status": "ok",
         "total": scored.height,
         "flagged": int(scored["wash_suspect"].sum()),
         "flag_rate": flag_rate,
+        "reason_breakdown": reason_breakdown,
     }
-
 
 # Step 1-2 - define CLI arguments
 def main():
@@ -383,6 +407,9 @@ def main():
     results = {"ok": 0, "passthrough": 0, "missing": 0}
     total_flagged = 0
 
+    logger.info("Generated %s wash-trade tasks for %s symbol(s) from %s to %s.", len(tasks), len(args.symbols), args.start,args.end)
+    logger.info("Submitting tasks to %s worker processes.", args.workers)
+
     # submit tasks to ProcessPoolExecutor to perform wash trade filtering in parallel
 
     with concurrent.futures.ProcessPoolExecutor(max_workers=args.workers) as executor:
@@ -412,8 +439,8 @@ def main():
             if result["status"] == "ok":
                 total_flagged += result["flagged"]
 
-    print(results)
-    print(f"total flagged trades: {total_flagged}")
+    logger.info("Wash-trade run complete: %s", results)
+    logger.info("Total flagged trades: %s", total_flagged)
 
 
 if __name__ == "__main__":
