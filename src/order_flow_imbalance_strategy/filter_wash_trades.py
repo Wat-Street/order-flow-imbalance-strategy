@@ -1,10 +1,10 @@
 import argparse
 import concurrent.futures
 import datetime as dt
-import sys
-from pathlib import Path
 import logging
 import logging.config
+import sys
+from pathlib import Path
 
 import polars as pl
 from tqdm import tqdm
@@ -12,9 +12,7 @@ from tqdm import tqdm
 # set up logging for progress tracking and post-run inspection
 LOG_CONFIG = {
     "version": 1,
-    "formatters": {
-        "standard": {"format": "%(asctime)s - %(levelname)s - %(message)s"}
-    },
+    "formatters": {"standard": {"format": "%(asctime)s - %(levelname)s - %(message)s"}},
     "handlers": {
         "console": {
             "class": "logging.StreamHandler",
@@ -83,15 +81,19 @@ def match_trades_to_price(symbol, date_str):
     )
 
     matched_data = (
-        trades
-        .join_asof(prices, on="timestamp", strategy="backward", tolerance="100ms")
+        trades.join_asof(prices, on="timestamp", strategy="backward", tolerance="100ms")
         .rename({"bid_price": "bid_before", "ask_price": "ask_before"})
         .join_asof(after_quotes, on="timestamp", strategy="forward", tolerance="100ms")
         .collect()
     )
 
     if matched_data.height < MIN_CSV_SIZE:
-        logger.info("Skipping %s on %s because file has only %s rows rows.", symbol,date_str, matched_data.height)
+        logger.info(
+            "Skipping %s on %s because file has only %s rows rows.",
+            symbol,
+            date_str,
+            matched_data.height,
+        )
         return None
 
     # return a polars dataframe with the matched data
@@ -146,6 +148,7 @@ def zero_price_impact(df, impact_eps_bps, size_quantile, horizon):
 
 # Off-Touch Execution
 
+
 def off_touch_execution(df, touch_floor_bps=2.0):
     # bracket matching
     bracket_low = pl.min_horizontal(["bid_before", "bid_after"])
@@ -158,9 +161,12 @@ def off_touch_execution(df, touch_floor_bps=2.0):
     # calculate a score from 0 to 1 for off touch execution
     # closer to 0 = trade price was inside the before/after bracket
     # closer to 1 = trade price was outside the bracket, making it suspicious
-    score = (distance / ( pl.col("price") * (touch_floor_bps / 1e4) )).clip(lower_bound=0.0, upper_bound=1.0)
+    score = (distance / (pl.col("price") * (touch_floor_bps / 1e4))).clip(
+        lower_bound=0.0, upper_bound=1.0
+    )
 
     return df.select(score.fill_null(0.0)).to_series()
+
 
 # Ping-Pong Reversal
 def ping_pong_reversal(df, ping_pong_window):
@@ -297,11 +303,11 @@ def process_task(
     # Checking if the output file already exists so failed runs can be restarted
     # is commented out because we may still want to rerun with different parameters
     # on the same files for testing/tuning purposes
-    
-    #if out_path.exists():
+
+    # if out_path.exists():
     #    logger.info("Skipping %s on %s because output file already exists.", symbol, date_str)
     #    return {"symbol": symbol, "date": date_str, "status": "skipped_existing"}
-    
+
     matched_data = match_trades_to_price(symbol, date_str)
 
     # skip if file is smaller than MIN_CSV_SIZE or if the parquet file is missing
@@ -310,7 +316,9 @@ def process_task(
 
     if passthrough:
         matched_data.write_parquet(out_path)
-        logger.info("Passthrough wrote %s on %s with %s rows.", symbol, date_str, matched_data.height)
+        logger.info(
+            "Passthrough wrote %s on %s with %s rows.", symbol, date_str, matched_data.height
+        )
         return {
             "symbol": symbol,
             "date": date_str,
@@ -321,33 +329,59 @@ def process_task(
     # all the scoring functions assume that the data is sorted by timestamp
     matched_data = matched_data.sort("timestamp", maintain_order=True)
 
-    score_cols = ["impact_score", "touch_score", "ping_pong_score", "duplicate_score", "size_cluster_score"]
+    score_cols = [
+        "impact_score",
+        "touch_score",
+        "ping_pong_score",
+        "duplicate_score",
+        "size_cluster_score",
+    ]
 
-    scored = matched_data.with_columns([
-        zero_price_impact(matched_data, impact_eps, size_quantile, impact_horizon).alias("impact_score"),
-        off_touch_execution(matched_data, touch_floor_bps).alias("touch_score"),
-        ping_pong_reversal(matched_data, pingpong_window).alias("ping_pong_score"),
-        duplicate_prints(matched_data).alias("duplicate_score"),
-        size_clustering(matched_data, size_quantile).alias("size_cluster_score"),
-    ]).with_columns(
-        pl.max_horizontal(score_cols).alias("wash_score")
-
-    ).with_columns(
-        (pl.col("wash_score") >= wash_score_cut).alias("wash_suspect"),
-        pl.when(pl.col("impact_score") == pl.col("wash_score")).then(pl.lit("impact_score"))
-        .when(pl.col("touch_score") == pl.col("wash_score")).then(pl.lit("touch_score"))
-        .when(pl.col("ping_pong_score") == pl.col("wash_score")).then(pl.lit("ping_pong_score"))
-        .when(pl.col("duplicate_score") == pl.col("wash_score")).then(pl.lit("duplicate_score"))
-        .otherwise(pl.lit("size_cluster_score"))
-        .alias("wash_reason")
-
-        # cleaned-flow columns (buy_qty_clean, sell_qty_clean, notional_clean) 
-        # suspected prints are zeroed 
-    ).with_columns([
-        pl.when(pl.col("wash_suspect")).then(0.0).otherwise(pl.col("buy_qty")).alias("buy_qty_clean"),
-        pl.when(pl.col("wash_suspect")).then(0.0).otherwise(pl.col("sell_qty")).alias("sell_qty_clean"),
-        pl.when(pl.col("wash_suspect")).then(0.0).otherwise(pl.col("notional")).alias("notional_clean"),
-    ])
+    scored = (
+        matched_data.with_columns(
+            [
+                zero_price_impact(matched_data, impact_eps, size_quantile, impact_horizon).alias(
+                    "impact_score"
+                ),
+                off_touch_execution(matched_data, touch_floor_bps).alias("touch_score"),
+                ping_pong_reversal(matched_data, pingpong_window).alias("ping_pong_score"),
+                duplicate_prints(matched_data).alias("duplicate_score"),
+                size_clustering(matched_data, size_quantile).alias("size_cluster_score"),
+            ]
+        )
+        .with_columns(pl.max_horizontal(score_cols).alias("wash_score"))
+        .with_columns(
+            (pl.col("wash_score") >= wash_score_cut).alias("wash_suspect"),
+            pl.when(pl.col("impact_score") == pl.col("wash_score"))
+            .then(pl.lit("impact_score"))
+            .when(pl.col("touch_score") == pl.col("wash_score"))
+            .then(pl.lit("touch_score"))
+            .when(pl.col("ping_pong_score") == pl.col("wash_score"))
+            .then(pl.lit("ping_pong_score"))
+            .when(pl.col("duplicate_score") == pl.col("wash_score"))
+            .then(pl.lit("duplicate_score"))
+            .otherwise(pl.lit("size_cluster_score"))
+            .alias("wash_reason"),
+            # cleaned-flow columns (buy_qty_clean, sell_qty_clean, notional_clean)
+            # suspected prints are zeroed
+        )
+        .with_columns(
+            [
+                pl.when(pl.col("wash_suspect"))
+                .then(0.0)
+                .otherwise(pl.col("buy_qty"))
+                .alias("buy_qty_clean"),
+                pl.when(pl.col("wash_suspect"))
+                .then(0.0)
+                .otherwise(pl.col("sell_qty"))
+                .alias("sell_qty_clean"),
+                pl.when(pl.col("wash_suspect"))
+                .then(0.0)
+                .otherwise(pl.col("notional"))
+                .alias("notional_clean"),
+            ]
+        )
+    )
 
     reason_counts = (
         scored.filter(pl.col("wash_suspect"))
@@ -367,22 +401,35 @@ def process_task(
 
     flag_rate = scored["wash_suspect"].mean()
     if flag_rate > 0.15:
-        logger.warning("Flag rate (%.3f) is greater than 0.15 for %s on %s; filtering may be too sensitive", flag_rate, symbol, date_str)
-    
+        logger.warning(
+            "Flag rate (%.3f) is greater than 0.15 for %s on %s; filtering may be too sensitive",
+            flag_rate,
+            symbol,
+            date_str,
+        )
+
     scored.write_parquet(out_path)
 
     logger.info(
         "Completed %s on %s: rows=%s flagged=%s flag_rate=%.3f reason_breakdown=%s",
-        symbol, date_str, scored.height, int(scored["wash_suspect"].sum()), flag_rate, reason_breakdown,
+        symbol,
+        date_str,
+        scored.height,
+        int(scored["wash_suspect"].sum()),
+        flag_rate,
+        reason_breakdown,
     )
 
     return {
-        "symbol": symbol, "date": date_str, "status": "ok",
+        "symbol": symbol,
+        "date": date_str,
+        "status": "ok",
         "total": scored.height,
         "flagged": int(scored["wash_suspect"].sum()),
         "flag_rate": flag_rate,
         "reason_breakdown": reason_breakdown,
     }
+
 
 # Step 1-2 - define CLI arguments
 def main():
@@ -426,7 +473,13 @@ def main():
     results = {"ok": 0, "passthrough": 0, "missing": 0, "skipped_existing": 0}
     total_flagged = 0
 
-    logger.info("Generated %s wash-trade tasks for %s symbol(s) from %s to %s.", len(tasks), len(args.symbols), args.start,args.end)
+    logger.info(
+        "Generated %s wash-trade tasks for %s symbol(s) from %s to %s.",
+        len(tasks),
+        len(args.symbols),
+        args.start,
+        args.end,
+    )
     logger.info("Submitting tasks to %s worker processes.", args.workers)
 
     # submit tasks to ProcessPoolExecutor to perform wash trade filtering in parallel

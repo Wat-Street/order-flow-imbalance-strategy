@@ -6,14 +6,14 @@ import pytest
 
 from order_flow_imbalance_strategy import filter_wash_trades
 from order_flow_imbalance_strategy.filter_wash_trades import (
+    duplicate_prints,
     generate_tasks,
     match_trades_to_price,
-    zero_price_impact,
     off_touch_execution,
     ping_pong_reversal,
-    duplicate_prints,
-    size_clustering,
     process_task,
+    size_clustering,
+    zero_price_impact,
 )
 
 T0 = dt.datetime(2024, 1, 1)
