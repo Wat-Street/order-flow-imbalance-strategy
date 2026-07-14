@@ -1,10 +1,10 @@
 import argparse
+import concurrent.futures
 import datetime as dt
 import sys
 from pathlib import Path
-import concurrent.futures
 
-import polars as pl 
+import polars as pl
 from tqdm import tqdm
 
 # define constants
@@ -36,10 +36,11 @@ def match_trades_to_price(symbol, date_str):
     trades = pl.scan_parquet(trades_path)
     prices = pl.scan_parquet(prices_path)
 
-    trades = trades.sort("transact_time")
-    prices = prices.sort("transaction_time")
+    # normalized schema uses a shared "timestamp" column for both tables
+    trades = trades.sort("timestamp")
+    prices = prices.sort("timestamp")
 
-    matched_data = trades.join_asof(prices, left_on="transact_time",right_on="transaction_time", strategy="backward").collect()
+    matched_data = trades.join_asof(prices, on="timestamp", strategy="backward").collect()
     
     if matched_data.height < MIN_CSV_SIZE:
       return None
@@ -50,18 +51,16 @@ def match_trades_to_price(symbol, date_str):
 # Step 5 - calculate suspicion clues
 
 # Zero Price-Impact
-def zero_price_impact(df, impact_eps):
-    # calculate price impact as the difference between the mid-price of the current trade and the next trade
-    mid = (pl.col("best_bid_price") + pl.col("best_ask_price")) / 2
-
+def zero_price_impact(df, impact_eps, size_quantile):
+    # price impact is the change in mid-price from the current trade to the next trade;
+    # mid_price is already provided by the normalized bookTicker schema
     df = df.with_columns(
-        mid.alias("mid_price"),
-        mid.shift(-1).alias("next_mid_price"),
-    ) 
+        pl.col("mid_price").shift(-1).alias("next_mid_price"),
+    )
 
-    # define a large trade as a trade larger than the 90th percentile of the last 500 trades
+    # define a large trade as a trade larger than the size_quantile of the last 500 trades
     df = df.with_columns([
-        pl.col("quantity").rolling_quantile(window_size=500, quantile=0.9).alias("size_baseline")
+        pl.col("quantity").rolling_quantile(window_size=500, quantile=size_quantile).alias("size_baseline")
     ])
     large_trade = pl.col("quantity") > pl.col("size_baseline")
 
@@ -76,11 +75,14 @@ def zero_price_impact(df, impact_eps):
 
 # Off-Touch Execution
 def off_touch_execution(df):
-    # compare the trade price to the best bid and ask prices
-    spread = pl.col("best_ask_price") - pl.col("best_bid_price")
+    # compare the trade price to the best bid and ask prices;
+    # spread is already provided by the normalized bookTicker schema
+    spread = pl.col("spread")
 
-    distance = (pl.when(pl.col("is_buyer_maker")).then((pl.col("price") - pl.col("best_bid_price")).abs())
-                                                       .otherwise((pl.col("price") - pl.col("best_ask_price")).abs())
+    # side == "sell" => seller was the aggressor (buyer is maker), so the trade
+    # should execute at the bid; otherwise the buyer lifted the ask
+    distance = (pl.when(pl.col("side") == "sell").then((pl.col("price") - pl.col("bid_price")).abs())
+                                                       .otherwise((pl.col("price") - pl.col("ask_price")).abs())
     )
 
     # calculate a score from 0 to 1 for off touch execution
@@ -92,8 +94,12 @@ def off_touch_execution(df):
 
 # Ping-Pong Reversal
 def ping_pong_reversal(df, ping_pong_window):
+    # normalized schema stores time as Datetime(ms); work in integer epoch-ms so the
+    # window arithmetic (ping_pong_window is in ms) matches the raw-schema behaviour
+
     # find the number of rows that are within the ping-pong window to see how many rows we need to lookback into to spot ping pong behaviour
-    times = df["transact_time"]
+    times = df["timestamp"].dt.epoch("ms")
+    time_ms = pl.col("timestamp").dt.epoch("ms")
 
     cutoff_times = times - ping_pong_window
     boundary_index = times.search_sorted(cutoff_times, side="left")
@@ -112,13 +118,13 @@ def ping_pong_reversal(df, ping_pong_window):
     for k in range(1, lookback + 1):
         prev_price = pl.col("price").shift(k)
         prev_qty = pl.col("quantity").shift(k)
-        prev_side = pl.col("is_buyer_maker").shift(k)
-        prev_time = pl.col("transact_time").shift(k)
-        delta_ms = pl.col("transact_time") - prev_time
+        prev_side = pl.col("side").shift(k)
+        prev_time = time_ms.shift(k)
+        delta_ms = time_ms - prev_time
 
         same_price = pl.col("price") == prev_price
         same_qty = pl.col("quantity") == prev_qty
-        flipped = pl.col("is_buyer_maker") != prev_side
+        flipped = pl.col("side") != prev_side
         fastness = (1.0 - delta_ms / float(ping_pong_window)).clip(lower_bound=0.0, upper_bound=1.0)
 
         # calculate a score for the row that is "k" rows back from the current row
@@ -134,9 +140,9 @@ def ping_pong_reversal(df, ping_pong_window):
 
 # Duplicate Prints
 def duplicate_prints(df):
-    # find the number of duplicate trades that have the same transact_time, price, quantity, and is_buyer_maker
+    # find the number of duplicate trades that have the same timestamp, price, quantity, and side
     df = df.with_columns([
-        pl.len().over(["transact_time", "price", "quantity", "is_buyer_maker"]).alias("duplicate_count")
+        pl.len().over(["timestamp", "price", "quantity", "side"]).alias("duplicate_count")
     ])
 
     # calculate a score for duplicate trades, where no duplicates = 0, one duplicate = 0.5, two duplicates = 0.67, and so on
@@ -181,8 +187,8 @@ def process_task(symbol, date_str, impact_eps, pingpong_window, size_quantile, w
         matched_data.write_parquet(out_path)
         return {"symbol": symbol, "date": date_str, "status": "passthrough", "rows": matched_data.height}
 
-    # all the scoring functions assume that the data is sorted by transact_time
-    matched_data = matched_data.sort("transact_time", maintain_order=True)
+    # all the scoring functions assume that the data is sorted by timestamp
+    matched_data = matched_data.sort("timestamp", maintain_order=True)
 
     scored = matched_data.with_columns([
         zero_price_impact(matched_data, impact_eps, size_quantile).alias("impact_score"),
