@@ -55,11 +55,13 @@ def match_trades_to_price(symbol, date_str):
 
 
 # Zero Price-Impact
-def zero_price_impact(df, impact_eps, size_quantile):
-    # price impact is the change in mid-price from the current trade to the next trade;
-    # mid_price is already provided by the normalized bookTicker schema
+def zero_price_impact(df, impact_eps_bps, size_quantile, horizon):
+    # price impact = relative mid-price move from the trade to `horizon` trades later.
+    # a horizon (rather than the immediate next trade) is required because the mid
+    # rarely changes between adjacent trades, so shift(-1) reports ~zero impact for
+    # almost every large trade. mid_price is provided by the normalized schema.
     df = df.with_columns(
-        pl.col("mid_price").shift(-1).alias("next_mid_price"),
+        pl.col("mid_price").shift(-horizon).alias("next_mid_price"),
     )
 
     # define a large trade as a trade larger than the size_quantile of the last 500 trades
@@ -72,28 +74,31 @@ def zero_price_impact(df, impact_eps, size_quantile):
     )
     large_trade = pl.col("quantity") > pl.col("size_baseline")
 
-    price_change = (pl.col("next_mid_price") - pl.col("mid_price")).abs()
+    # express the move in basis points so the threshold is scale-invariant across symbols
+    price_change_bps = (
+        (pl.col("next_mid_price") - pl.col("mid_price")).abs() / pl.col("mid_price") * 1e4
+    )
 
     # calculate score for price impact
     # closer to 0 = trade was large and had a price impact
     # closer to 1 = trade was large and had little/no price impact, making it suspicious
     score = (
-        pl.when(large_trade & (price_change < impact_eps))
-        .then(1)
+        pl.when(large_trade & (price_change_bps < impact_eps_bps))
+        .then(1.0)
         .when(large_trade)
-        .then((impact_eps - price_change) / impact_eps)
-        .otherwise(0)
+        .then(
+            ((impact_eps_bps - price_change_bps) / impact_eps_bps).clip(
+                lower_bound=0.0, upper_bound=1.0
+            )
+        )
+        .otherwise(0.0)
     )
 
     return df.select(score).to_series()
 
 
 # Off-Touch Execution
-def off_touch_execution(df):
-    # compare the trade price to the best bid and ask prices;
-    # spread is already provided by the normalized bookTicker schema
-    spread = pl.col("spread")
-
+def off_touch_execution(df, touch_floor_bps):
     # side == "sell" => seller was the aggressor (buyer is maker), so the trade
     # should execute at the bid; otherwise the buyer lifted the ask
     distance = (
@@ -102,10 +107,18 @@ def off_touch_execution(df):
         .otherwise((pl.col("price") - pl.col("ask_price")).abs())
     )
 
+    # the recorded touch is asof-matched and can be stale, so dividing by the raw
+    # half-spread saturates the score on tight books (where noise >> spread). Floor
+    # the denominator at touch_floor_bps of price so only trades that print
+    # meaningfully off-touch relative to price score high.
+    half_spread = pl.max_horizontal(
+        pl.col("spread") / 2, pl.col("mid_price") * touch_floor_bps / 1e4
+    )
+
     # calculate a score from 0 to 1 for off touch execution
     # closer to 0 = trade price was close to the exected bid or ask
     # closer to 1 = trade price was far from the expected bid or ask, making it suspicious
-    score = (distance / (spread / 2)).clip(lower_bound=0.0, upper_bound=1.0)
+    score = (distance / half_spread).clip(lower_bound=0.0, upper_bound=1.0)
 
     return df.select(score).to_series()
 
@@ -228,7 +241,15 @@ def size_clustering(df, size_quantile):
 
 # process each file
 def process_task(
-    symbol, date_str, impact_eps, pingpong_window, size_quantile, wash_score_cut, passthrough
+    symbol,
+    date_str,
+    impact_eps,
+    impact_horizon,
+    pingpong_window,
+    size_quantile,
+    touch_floor_bps,
+    wash_score_cut,
+    passthrough,
 ):
     matched_data = match_trades_to_price(symbol, date_str)
 
@@ -255,8 +276,10 @@ def process_task(
     scored = (
         matched_data.with_columns(
             [
-                zero_price_impact(matched_data, impact_eps, size_quantile).alias("impact_score"),
-                off_touch_execution(matched_data).alias("touch_score"),
+                zero_price_impact(matched_data, impact_eps, size_quantile, impact_horizon).alias(
+                    "impact_score"
+                ),
+                off_touch_execution(matched_data, touch_floor_bps).alias("touch_score"),
                 ping_pong_reversal(matched_data, pingpong_window).alias("ping_pong_score"),
                 duplicate_prints(matched_data).alias("duplicate_score"),
                 size_clustering(matched_data, size_quantile).alias("size_cluster_score"),
@@ -305,8 +328,24 @@ def main():
         "--wash-score-cut", help="threshold for wash trade detection", type=float, default=0.7
     )
 
-    # Should these have any default values?
-    parser.add_argument("--impact-eps", help="impact threshold", type=float, default=0.01)
+    parser.add_argument(
+        "--impact-eps",
+        type=float,
+        default=0.5,
+        help="min post-trade mid move (bps) below which a large trade is zero-impact",
+    )
+    parser.add_argument(
+        "--impact-horizon",
+        type=int,
+        default=50,
+        help="number of trades ahead to measure price impact over",
+    )
+    parser.add_argument(
+        "--touch-floor-bps",
+        type=float,
+        default=2.0,
+        help="floor for the off-touch half-spread denominator (bps of price)",
+    )
     parser.add_argument("--pingpong-window", help="ping-pong window size", type=int, default=500)
     parser.add_argument("--size-quantile", help="size quantile threshold", type=float, default=0.9)
 
@@ -329,8 +368,10 @@ def main():
                 symbol,
                 date_str,
                 args.impact_eps,
+                args.impact_horizon,
                 args.pingpong_window,
                 args.size_quantile,
+                args.touch_floor_bps,
                 args.wash_score_cut,
                 args.passthrough,
             )
