@@ -2,7 +2,6 @@ import argparse
 import concurrent.futures
 import datetime as dt
 import logging
-import logging.config
 import sys
 from pathlib import Path
 
@@ -10,35 +9,15 @@ import polars as pl
 from tqdm import tqdm
 
 # set up logging for progress tracking and post-run inspection
-LOG_CONFIG = {
-    "version": 1,
-    "formatters": {"standard": {"format": "%(asctime)s - %(levelname)s - %(message)s"}},
-    "handlers": {
-        "console": {
-            "class": "logging.StreamHandler",
-            "level": "INFO",
-            "stream": "ext://sys.stdout",
-            "formatter": "standard",
-        },
-        "file": {
-            "class": "logging.FileHandler",
-            "filename": "logs/filter_wash_trades.log",
-            "level": "DEBUG",
-            "mode": "a",
-            "formatter": "standard",
-        },
-    },
-    "loggers": {
-        "wash_trade_filter_logger": {
-            "handlers": ["console", "file"],
-            "level": "DEBUG",
-            "propagate": False,
-        }
-    },
-}
-
 Path("logs").mkdir(exist_ok=True)
-logging.config.dictConfig(LOG_CONFIG)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("logs/filter_wash_trades.log", mode="a"),
+    ],
+)
 logger = logging.getLogger("wash_trade_filter_logger")
 
 # define constants
