@@ -113,7 +113,25 @@ def ping_pong_reversal(df, ping_pong_window):
     # closer to 0 = trade was not part of a ping-pong reversal
     # closer to 1 = trade was likely part of a ping-pong reversal, making it suspicious
     # closer to 1 means trades with the same price and quantity, but opposite sides, occurred closer together
-    scores = []
+
+    # fold the per-lookback scores into a running maximum in batches so peak memory
+    # stays O(rows): lookback can exceed 1000 on liquid symbols, and materializing
+    # that many full-length columns at once to max_horizontal would exhaust memory
+    batch_size = 32
+    running_max = None
+    batch = []
+
+    def fold(batch, running_max):
+        if not batch:
+            return running_max
+        batch_max = df.select(pl.max_horizontal(batch).alias("score")).to_series()
+        if running_max is None:
+            return batch_max
+        return (
+            pl.DataFrame({"running": running_max, "batch": batch_max})
+            .select(pl.max_horizontal("running", "batch").alias("score"))
+            .to_series()
+        )
 
     for k in range(1, lookback + 1):
         prev_price = pl.col("price").shift(k)
@@ -133,10 +151,15 @@ def ping_pong_reversal(df, ping_pong_window):
             (delta_ms > 0) & (delta_ms <= ping_pong_window) & flipped & same_price & same_qty
         ).then(fastness).otherwise(0.0)
 
-        scores.append(row_score)
+        batch.append(row_score)
+        if len(batch) >= batch_size:
+            running_max = fold(batch, running_max)
+            batch = []
 
-    max_score = pl.max_horizontal(scores)
-    return df.select(max_score).to_series()
+    running_max = fold(batch, running_max)
+    if running_max is None:
+        running_max = pl.Series("score", [0.0] * df.height)
+    return running_max
 
 # Duplicate Prints
 def duplicate_prints(df):
