@@ -42,7 +42,17 @@ def match_trades_to_price(symbol, date_str):
     trades = trades.sort("timestamp")
     prices = prices.sort("timestamp")
 
-    matched_data = trades.join_asof(prices, on="timestamp", strategy="backward").collect()
+    after_quotes = prices.select(["timestamp", "bid_price", "ask_price"]).rename(
+        {"bid_price": "bid_after", "ask_price": "ask_after"}
+    )
+
+    matched_data = (
+        trades
+        .join_asof(prices, on="timestamp", strategy="backward", tolerance="100ms")
+        .rename({"bid_price": "bid_before", "ask_price": "ask_before"})
+        .join_asof(after_quotes, on="timestamp", strategy="forward", tolerance="100ms")
+        .collect()
+    )
 
     if matched_data.height < MIN_CSV_SIZE:
         return None
@@ -98,30 +108,22 @@ def zero_price_impact(df, impact_eps_bps, size_quantile, horizon):
 
 
 # Off-Touch Execution
-def off_touch_execution(df, touch_floor_bps):
-    # side == "sell" => seller was the aggressor (buyer is maker), so the trade
-    # should execute at the bid; otherwise the buyer lifted the ask
-    distance = (
-        pl.when(pl.col("side") == "sell")
-        .then((pl.col("price") - pl.col("bid_price")).abs())
-        .otherwise((pl.col("price") - pl.col("ask_price")).abs())
-    )
 
-    # the recorded touch is asof-matched and can be stale, so dividing by the raw
-    # half-spread saturates the score on tight books (where noise >> spread). Floor
-    # the denominator at touch_floor_bps of price so only trades that print
-    # meaningfully off-touch relative to price score high.
-    half_spread = pl.max_horizontal(
-        pl.col("spread") / 2, pl.col("mid_price") * touch_floor_bps / 1e4
-    )
+def off_touch_execution(df, touch_floor_bps=2.0):
+    # bracket matching
+    bracket_low = pl.min_horizontal(["bid_before", "bid_after"])
+    bracket_high = pl.max_horizontal(["ask_before", "ask_after"])
+
+    below = (bracket_low - pl.col("price")).clip(lower_bound=0.0)
+    above = (pl.col("price") - bracket_high).clip(lower_bound=0.0)
+    distance = pl.max_horizontal([below, above])
 
     # calculate a score from 0 to 1 for off touch execution
-    # closer to 0 = trade price was close to the exected bid or ask
-    # closer to 1 = trade price was far from the expected bid or ask, making it suspicious
-    score = (distance / half_spread).clip(lower_bound=0.0, upper_bound=1.0)
+    # closer to 0 = trade price was inside the before/after bracket
+    # closer to 1 = trade price was outside the bracket, making it suspicious
+    score = (distance / ( pl.col("price") * (touch_floor_bps / 1e4) )).clip(lower_bound=0.0, upper_bound=1.0)
 
-    return df.select(score).to_series()
-
+    return df.select(score.fill_null(0.0)).to_series()
 
 # Ping-Pong Reversal
 def ping_pong_reversal(df, ping_pong_window):
@@ -300,12 +302,34 @@ def process_task(
         .with_columns((pl.col("wash_score") >= wash_score_cut).alias("wash_suspect"))
     )
 
+
+    # track the reason for wash suspicion 
+
+    reason_counts = (
+        scored.filter(pl.col("wash_suspect"))
+        .group_by("wash_reason")
+        .agg(pl.len().alias("count"))
+        .with_columns(
+            (pl.col("count") / pl.col("count").sum() * 100).alias("pct")
+        )
+        .sort("count", descending=True)
+    )
+
+    reason_breakdown = {
+        row["wash_reason"]: {"count": row["count"], "pct": row["pct"]}
+        for row in reason_counts.to_dicts()
+    }
+
+
     clean_volume = scored.filter(~pl.col("wash_suspect"))["quantity"].sum()
     assert clean_volume <= matched_data["quantity"].sum()
 
     flag_rate = scored["wash_suspect"].mean()
 
     scored.write_parquet(out_path)
+
+    print(flag_rate)
+    print(reason_breakdown)
 
     return {
         "symbol": symbol,
