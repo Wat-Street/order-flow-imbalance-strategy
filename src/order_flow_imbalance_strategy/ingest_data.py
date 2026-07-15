@@ -16,6 +16,10 @@ from tqdm import tqdm
 # step 8: configure logging
 LOG_CONFIG = {
     "version": 1,
+    # Don't disable loggers configured by sibling modules on import: dictConfig
+    # defaults this to True, so importing another module's config would silence
+    # this logger (and break caplog propagation in tests).
+    "disable_existing_loggers": False,
     "formatters": {"standard": {"format": "%(asctime)s - %(levelname)s - %(message)s"}},
     "handlers": {
         "console": {

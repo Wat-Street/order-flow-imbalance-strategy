@@ -14,6 +14,16 @@ skip, status-dict-never-raise workers, ``ThreadPoolExecutor``, two log handlers
   The bucket is requester-pays, so ``RequestPayer='requester'`` is mandatory and
   AWS credentials must be resolvable via the standard boto3 chain.
 
+  Each line's schema (confirmed against a live sample — see
+  ``scripts/probe_hyperliquid_format.py``) wraps the WebSocket ``l2Book`` message
+  under ``raw`` and adds archive capture metadata::
+
+      {"time": "<ISO-8601 ns capture ts>", "ver_num": 1,
+       "raw": {"channel": "l2Book",
+               "data": {"coin": "BTC", "time": <epoch-ms>,
+                        "levels": [[{"px","sz","n"}, ...],    # bids
+                                   [{"px","sz","n"}, ...]]}}}  # asks
+
 * **Integrity** — Hyperliquid publishes no checksums, so the checksum gate of the
   Binance path is replaced by a light *structural* validation: the file
   decompresses cleanly and its first line parses as a non-empty JSON object.
@@ -21,8 +31,9 @@ skip, status-dict-never-raise workers, ``ThreadPoolExecutor``, two log handlers
 * **Output — raw, full depth, untransformed**, matching the Binance raw layer's
   "store exactly as the source provides it" rule. We decompress (the analog of
   unzipping) and keep the newline-JSON verbatim; normalization to a flat,
-  schema-enforced Parquet and resampling to the 1-second grid are deferred to a
-  parallel Stage-2/Stage-3::
+  schema-enforced Parquet (``normalize_hyperliquid``, Stage 2) and resampling to
+  the 1-second grid (``align_hyperliquid``, Stage 3) are deferred to those
+  parallel stages::
 
       data/raw_hl/{COIN}/l2Book/{COIN}-l2Book-{YYYY-MM-DD}-{HH}.jsonl
 
@@ -47,13 +58,19 @@ from pathlib import Path
 import boto3
 import lz4.frame
 from botocore.config import Config
-from botocore.exceptions import BotoCoreError, ClientError
+from botocore.exceptions import (
+    BotoCoreError,
+    ClientError,
+    NoCredentialsError,
+)
 from tqdm import tqdm
 
 # Configure logging: console INFO + full-detail DEBUG file (append), mirroring
 # the Binance ingester so both tracks log the same way.
 LOG_CONFIG = {
     "version": 1,
+    # See ingest_data.py: keep sibling modules' loggers alive on import.
+    "disable_existing_loggers": False,
     "formatters": {"standard": {"format": "%(asctime)s - %(levelname)s - %(message)s"}},
     "handlers": {
         "console": {
@@ -85,6 +102,9 @@ logger = logging.getLogger("hyperliquid_logger")
 # --- constants -------------------------------------------------------------
 
 BUCKET = "hyperliquid-archive"
+# The archive bucket lives in ap-northeast-1. Pin it so ingestion works
+# regardless of whether a user has a default region configured.
+BUCKET_REGION = "ap-northeast-1"
 DATA_TYPE = "l2Book"
 DEFAULT_COINS = ["BTC"]
 HOURS = range(24)
@@ -101,12 +121,48 @@ def make_s3_client():
     its own outer backoff loop for logging + missing-key classification."""
     return boto3.client(
         "s3",
+        region_name=BUCKET_REGION,
         config=Config(
             connect_timeout=10,
             read_timeout=300,
             retries={"max_attempts": 3, "mode": "standard"},
         ),
     )
+
+
+CREDS_HELP = (
+    "AWS credentials are required — the Hyperliquid archive bucket is "
+    "requester-pays, so each user must authenticate with their own AWS "
+    "account (fetches bill to that account, ~$0.09/GB egress).\n"
+    "Set up credentials via ANY one of:\n"
+    "  1. aws login            (keyless SSO session; needs: pip install 'botocore[crt]')\n"
+    "  2. aws configure        (an IAM user's access key; scope: AmazonS3ReadOnlyAccess)\n"
+    "  3. env vars             AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY\n"
+    "Then verify with:  aws sts get-caller-identity\n"
+    "Only needed to *fetch* raw data — downstream stages read the committed "
+    "Parquet and need no AWS."
+)
+
+
+def preflight_credentials() -> None:
+    """Fail fast with an actionable message if AWS credentials are missing or
+    invalid, instead of surfacing a raw boto3 traceback mid-download. Uses STS
+    ``get_caller_identity`` (a free, permission-less identity echo)."""
+    sts = boto3.client("sts", region_name=BUCKET_REGION)
+    try:
+        identity = sts.get_caller_identity()
+    except NoCredentialsError:
+        logger.error("No AWS credentials found.")
+        sys.exit(f"\nNo AWS credentials found.\n\n{CREDS_HELP}")
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        logger.error("AWS credentials rejected: %s", code)
+        sys.exit(f"\nAWS credentials were found but rejected ({code}).\n\n{CREDS_HELP}")
+    except BotoCoreError as exc:
+        # e.g. the botocore[crt] MissingDependencyException for `aws login`.
+        logger.error("Could not resolve AWS credentials: %s", exc)
+        sys.exit(f"\nCould not resolve AWS credentials:\n  {exc}\n\n{CREDS_HELP}")
+    logger.info("AWS identity OK: %s", identity.get("Arn", "<unknown>"))
 
 
 # --- path / key builders ---------------------------------------------------
@@ -242,12 +298,24 @@ def download_and_extract(client, data_dir, coin: str, date_str: str, hour: int):
 
 def validate_extracted(path: Path) -> bool:
     """Structural integrity gate (the checksum analog): the file is non-empty and
-    its first line is a non-empty JSON object.
+    its first line matches the real Hyperliquid archive l2Book schema.
 
-    NOTE: the exact per-snapshot schema is not asserted here — Hyperliquid's
-    archive schema is not officially documented, so tightening this to specific
-    keys (``time``/``levels``/…) is a TODO once a real sample is inspected. On
-    failure the corrupt file is deleted so the next run re-downloads it.
+    Schema confirmed by fetching a live sample (see
+    ``scripts/probe_hyperliquid_format.py``). Each line is::
+
+        {"time": "<ISO-8601 ns capture ts>",   # archive capture timestamp
+         "ver_num": 1,
+         "raw": {"channel": "l2Book",
+                 "data": {"coin": "<COIN>",
+                          "time": <epoch-ms event time>,
+                          "levels": [[{px,sz,n}, ...],   # bids
+                                     [{px,sz,n}, ...]]}}} # asks
+
+    The docs (and the info-API) describe a flatter shape; the archive actually
+    nests the WebSocket message under ``raw`` and adds its own capture ``time``
+    and ``ver_num``. We assert the load-bearing invariant: ``raw.data.levels`` is
+    a 2-element ``[bids, asks]`` array. On failure the corrupt file is deleted so
+    the next run re-downloads it.
     """
     try:
         with open(path, encoding="utf-8") as f:
@@ -257,8 +325,14 @@ def validate_extracted(path: Path) -> bool:
         record = json.loads(first_line)
         if not isinstance(record, dict) or not record:
             raise ValueError("first line is not a non-empty JSON object")
+        data = record.get("raw", {}).get("data")
+        if not isinstance(data, dict):
+            raise ValueError("missing raw.data object")
+        levels = data.get("levels")
+        if not (isinstance(levels, list) and len(levels) == 2):
+            raise ValueError("raw.data.levels is not a 2-element [bids, asks] array")
         return True
-    except (ValueError, OSError) as exc:
+    except (ValueError, AttributeError, OSError) as exc:
         logger.error("Validation FAILED, deleting: path=%s — %s", path, exc)
         path.unlink(missing_ok=True)
         return False
@@ -323,6 +397,10 @@ def main():
     if args.start > args.end:
         logger.error("Invalid date range: start=%s end=%s", args.start, args.end)
         sys.exit("start date must be before end date")
+
+    # Fail fast on missing/invalid credentials before spawning the pool, so users
+    # get an actionable message instead of a traceback after tasks start.
+    preflight_credentials()
 
     data_dir = Path(args.data_dir)
     tasks = generate_tasks(args)

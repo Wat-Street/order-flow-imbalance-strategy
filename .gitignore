@@ -199,7 +199,7 @@ cython_debug/
 #   that can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
 #   and can be added to the global gitignore or merged into this file. However, if you prefer, 
 #   you could uncomment the following to ignore the entire vscode folder
-# .vscode/
+.vscode/
 # Temporary file for partial code execution
 tempCodeRunnerFile.py
 
@@ -220,5 +220,8 @@ __marimo__/
 # logs
 logs/
 
-# data
+# data — ALL layers stay out of git (raw, Stage-2 intermediate, and the Stage-3
+# aligned artifact). The aligned dataset is too large for git/LFS (~21 GB for full
+# BTC history), so it is hosted externally and fetched via scripts/hl_data.py
+# (see README "Data & AWS setup"). Nothing under data/ is committed.
 data/

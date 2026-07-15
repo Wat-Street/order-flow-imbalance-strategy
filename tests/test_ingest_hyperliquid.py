@@ -12,11 +12,31 @@ from moto import mock_aws
 
 import order_flow_imbalance_strategy.ingest_hyperliquid as ih
 
-# A minimal two-snapshot NDJSON payload. The exact archive schema is not
-# officially documented, so tests only rely on "one JSON object per line".
+
+# A minimal two-snapshot NDJSON payload in the REAL archive schema (confirmed by
+# a live probe — see scripts/probe_hyperliquid_format.py): the WebSocket l2Book
+# message nested under "raw", plus the archive's capture "time" and "ver_num".
+def _archive_line(event_ms: int, bid_px: str, ask_px: str) -> dict:
+    return {
+        "time": "2024-01-01T00:00:00.000000000",
+        "ver_num": 1,
+        "raw": {
+            "channel": "l2Book",
+            "data": {
+                "coin": "BTC",
+                "time": event_ms,
+                "levels": [
+                    [{"px": bid_px, "sz": "1.0", "n": 3}],
+                    [{"px": ask_px, "sz": "0.5", "n": 2}],
+                ],
+            },
+        },
+    }
+
+
 SNAPSHOT_LINES = [
-    {"coin": "BTC", "time": 1704067200000, "levels": [[{"px": "42000", "sz": "1.0", "n": 3}], []]},
-    {"coin": "BTC", "time": 1704067200100, "levels": [[{"px": "42001", "sz": "0.5", "n": 2}], []]},
+    _archive_line(1704067200000, "42000", "42010"),
+    _archive_line(1704067200100, "42001", "42011"),
 ]
 RAW_NDJSON = ("\n".join(json.dumps(s) for s in SNAPSHOT_LINES) + "\n").encode("utf-8")
 
