@@ -1,0 +1,25 @@
+{
+  "signal_column": "ofi_clean",
+  "timestamp_column": "timestamp",
+  "grid_seconds": 1,
+  "horizons": [
+    {
+      "column": "ofi_1m",
+      "half_life_seconds": 30,
+      "min_periods": 30,
+      "_comment": "1-minute horizon: half-life 30s on a 1s grid (~60s effective memory)"
+    },
+    {
+      "column": "ofi_5m",
+      "half_life_seconds": 150,
+      "min_periods": 150,
+      "_comment": "5-minute horizon: half-life 150s on a 1s grid (~300s effective memory)"
+    },
+    {
+      "column": "ofi_15m",
+      "half_life_seconds": 450,
+      "min_periods": 450,
+      "_comment": "15-minute horizon: half-life 450s on a 1s grid (~900s effective memory)"
+    }
+  ]
+}

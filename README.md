@@ -30,3 +30,17 @@ Early-stage development (Phase 1: Data Ingestion + Pipeline Foundation)
 ## Development
 
 Use the dev container for a consistent environment (see [CONTRIBUTING.md](CONTRIBUTING.md)), or install locally with `pip install -e ".[dev]"`. Run `./scripts/check.sh` before opening a PR.
+
+### Multi-horizon fusion
+
+Stage C applies causal exponential filters to spoof-adjusted Stage-B OFI. It preserves the
+input schema, appends `ofi_1m`, `ofi_5m`, and `ofi_15m`, resets after missing/invalid samples,
+and uses the prior day's Stage-B file to avoid an artificial midnight warm-up.
+
+```bash
+ofi-multihorizon-fusion --symbols BTCUSDT ETHUSDT \
+  --start 2024-01-01 --end 2024-01-31 \
+  --config configs/multihorizon_fusion.json
+```
+
+Existing Stage-C files are skipped unless `--overwrite` is supplied. Writes are atomic.
