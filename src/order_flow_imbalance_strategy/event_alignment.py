@@ -66,9 +66,19 @@ def build_alignment_engine(
         .sort("dt_1s")
     )
 
-    # creating the 1-second base grid mapped strictly to the book ticker bounds
+    # 1-second base grid spanning the full UTC day of the data (00:00:00 ..
+    # 23:59:59), so every per-day aligned file has the same 86,400-row grid
+    # regardless of when the first/last book update landed. Seconds before the
+    # first native book (nothing to carry yet) are dropped after the join below;
+    # trailing seconds are forward-filled and flagged stale. datetime_ranges is
+    # inclusive of both bounds.
+    day_start = pl.col("dt_1s").min().dt.truncate("1d")
     grid = book.select(
-        pl.datetime_ranges(pl.col("dt_1s").min(), pl.col("dt_1s").max(), "1s").alias("dt_1s")
+        pl.datetime_ranges(
+            day_start,
+            day_start + pl.duration(days=1) - pl.duration(seconds=1),
+            "1s",
+        ).alias("dt_1s")
     ).explode("dt_1s", empty_as_null=True)
 
     # ASOF join handles the forward-filling
@@ -101,9 +111,15 @@ def build_alignment_engine(
             pl.col("signed_volume").fill_null(0.0),
         ]
     )
+    # Drop the seconds before the first native book update — there is nothing to
+    # carry forward there (a null carried book). Trailing seconds after the last
+    # update are retained (forward-filled, flagged stale) to keep full-day coverage.
+    aligned = aligned.filter(pl.col("exact_time").is_not_null())
+
     # book_stale_prev: the previous grid second was stale (or absent). ofi.py
     # derives its own t-1 flag internally, but carry it for provenance and parity
-    # with the L2 aligned schema. Grid rows are already in ascending time order.
+    # with the L2 aligned schema. Grid rows are already in ascending time order;
+    # computed after the leading-drop so the first retained row's prev is null->True.
     return (
         aligned.with_columns(pl.col("book_stale").shift(1).fill_null(True).alias("book_stale_prev"))
         .drop("exact_time")

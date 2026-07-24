@@ -51,7 +51,10 @@ def mock_trades_lf():
 def test_alignment_engine_edge_cases(mock_book_lf, mock_trades_lf, mock_klines_lf):
     result = build_alignment_engine(mock_book_lf, mock_trades_lf, mock_klines_lf).collect()
 
-    assert result.height == 66
+    # Full UTC day (00:00:00-23:59:59) minus the seconds before the first native
+    # book update at 09:00:00 => 09:00:00..23:59:59 = 15h * 3600 = 54,000 rows.
+    assert result.height == 54_000
+    # Row 0 is the first native second, so all index-based checks below still hold.
 
     # Klines Lookahead Bias
     assert result.item(0, "close") == 99.0
