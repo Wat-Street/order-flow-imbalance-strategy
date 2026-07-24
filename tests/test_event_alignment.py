@@ -7,6 +7,11 @@ from order_flow_imbalance_strategy.event_alignment import build_alignment_engine
 
 T0 = int(datetime(2023, 1, 1, 9, 0, 0, tzinfo=UTC).timestamp() * 1000)
 
+# The normalized Stage-2 schema stores ``timestamp`` as Datetime("ms"); an
+# Int64 -> Datetime("ms") cast interprets the value as epoch-ms, so the T0
+# offsets below stay readable while matching the real dtype the engine consumes.
+_TS = pl.col("timestamp").cast(pl.Datetime("ms"))
+
 
 @pytest.fixture
 def mock_book_lf():
@@ -16,12 +21,12 @@ def mock_book_lf():
             "bid_price": [100.0, 101.0, 102.0],
             "ask_price": [100.5, 101.5, 102.5],
         }
-    )
+    ).with_columns(_TS)
 
 
 @pytest.fixture
 def mock_klines_lf():
-    return pl.LazyFrame({"timestamp": [T0 - 60_000, T0], "close": [99.0, 105.0]})
+    return pl.LazyFrame({"timestamp": [T0 - 60_000, T0], "close": [99.0, 105.0]}).with_columns(_TS)
 
 
 @pytest.fixture
@@ -34,7 +39,7 @@ def mock_trades_lf():
             "buy_qty": [5.0],
             "sell_qty": [0.0],
         }
-    )
+    ).with_columns(_TS)
 
 
 def test_alignment_engine_edge_cases(mock_book_lf, mock_trades_lf, mock_klines_lf):
