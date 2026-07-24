@@ -17,7 +17,8 @@ def build_alignment_engine(
         .sort("dt_1s")
     )
 
-    # truncate book updates to 1s, keep the final state per second
+    # truncate book updates to 1s, keep the final s
+    # tate per second
     book = (
         book_lf.with_columns(
             [
@@ -57,7 +58,7 @@ def build_alignment_engine(
     # creating the 1-second base grid mapped strictly to the book ticker bounds
     grid = book.select(
         pl.datetime_ranges(pl.col("dt_1s").min(), pl.col("dt_1s").max(), "1s").alias("dt_1s")
-    ).explode("dt_1s")
+    ).explode("dt_1s", empty_as_null=True)
 
     # ASOF join handles the forward-filling
     aligned = (
