@@ -38,19 +38,24 @@ def build_alignment_engine(
         .sort("dt_1s")
     )
 
-    # aggregate trades per second (volume, signed_volume, VWAP)
+    # aggregate trades per second (volume, signed_volume, VWAP). The trade inputs
+    # are the wash-filtered *cleaned-flow* columns from Stage-4: buy_qty / sell_qty
+    # / notional carry the runner's renames of buy_qty_clean / sell_qty_clean /
+    # notional_clean, so trades flagged as wash never reach the aligned volume,
+    # VWAP, or signed volume. Volume and notional are derived from the cleaned
+    # split rather than a raw price*quantity so all three agree on the same tape.
     trades = (
         trades_lf.with_columns(pl.col("timestamp").dt.truncate("1s").alias("dt_1s"))
         .drop("timestamp")
         .group_by("dt_1s")
         .agg(
             [
-                pl.col("quantity").sum().alias("volume"),
-                (pl.col("price") * pl.col("quantity")).sum().alias("quote_vol"),
                 pl.col("buy_qty").sum().alias("buy_vol"),
                 pl.col("sell_qty").sum().alias("sell_vol"),
+                pl.col("notional").sum().alias("quote_vol"),
             ]
         )
+        .with_columns((pl.col("buy_vol") + pl.col("sell_vol")).alias("volume"))
         .with_columns(
             [
                 (pl.col("quote_vol") / pl.col("volume")).alias("vwap"),

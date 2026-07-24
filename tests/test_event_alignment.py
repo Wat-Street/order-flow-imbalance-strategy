@@ -20,6 +20,10 @@ def mock_book_lf():
             "timestamp": [T0, T0 + 10_000, T0 + 65_000],
             "bid_price": [100.0, 101.0, 102.0],
             "ask_price": [100.5, 101.5, 102.5],
+            # bid_qty / ask_qty are part of the normalized bookTicker schema and
+            # are required by ofi.py; they must survive the alignment untouched.
+            "bid_qty": [10.0, 11.0, 12.0],
+            "ask_qty": [20.0, 21.0, 22.0],
         }
     ).with_columns(_TS)
 
@@ -31,13 +35,15 @@ def mock_klines_lf():
 
 @pytest.fixture
 def mock_trades_lf():
+    # cleaned-flow columns (buy_qty/sell_qty/notional) as produced by the wash
+    # filter (buy_qty_clean/sell_qty_clean/notional_clean, renamed by the runner).
+    # notional = price * quantity = 100.2 * 5 = 501.0, so VWAP recovers 100.2.
     return pl.LazyFrame(
         {
             "timestamp": [T0 + 2_000],
-            "price": [100.2],
-            "quantity": [5.0],
             "buy_qty": [5.0],
             "sell_qty": [0.0],
+            "notional": [501.0],
         }
     ).with_columns(_TS)
 
@@ -67,3 +73,10 @@ def test_alignment_engine_edge_cases(mock_book_lf, mock_trades_lf, mock_klines_l
     assert result.item(3, "no_trades") is True
     assert result.item(3, "volume") == 0.0
     assert result.item(3, "vwap") is None
+
+    # ofi.py requires bid_qty / ask_qty; they must pass through the alignment
+    # (carried by the last book update in each second, forward-filled otherwise).
+    assert {"bid_qty", "ask_qty"} <= set(result.columns)
+    assert result.item(0, "bid_qty") == 10.0
+    assert result.item(0, "ask_qty") == 20.0
+    assert result.item(10, "bid_qty") == 11.0  # second book update at T0+10s
