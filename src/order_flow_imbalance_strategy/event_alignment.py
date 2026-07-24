@@ -1,4 +1,14 @@
+import argparse
+import logging
+import os
+import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from datetime import datetime, timedelta
+from pathlib import Path
+
 import polars as pl
+
+logger = logging.getLogger("EventAlignment")
 
 
 def build_alignment_engine(
@@ -127,3 +137,163 @@ def build_alignment_engine(
         # on and diffs; the raw book timestamp was dropped above so there is no clash.
         .rename({"dt_1s": "timestamp"})
     )
+
+
+# ---------------------------------------------------------------------------
+# Stage-3 runner: per-symbol-day I/O, mirroring the other stages (normalize_data,
+# klines, filter_wash_trades) — argparse CLI + ProcessPoolExecutor, reading the
+# normalized Stage-2/Stage-4 parquet and writing the Stage-5 input that ofi.py
+# consumes at data/aligned/{SYMBOL}/{SYMBOL}-aligned-{date}.parquet.
+# ---------------------------------------------------------------------------
+
+DEFAULT_DATA_DIR = "data"
+DEFAULT_PROCESSED_DIR = "data/processed"
+MIN_OUTPUT_ROWS = 100
+
+# Columns pulled from each normalized input. Trades come from the wash-filtered
+# Stage-4 output; its cleaned-flow columns are renamed to the generic names the
+# transform expects. Neither trades nor klines carry ``asset`` into the join
+# (the book already contributes it) to avoid a duplicate-column clash.
+BOOK_COLUMNS = ["timestamp", "asset", "bid_price", "ask_price", "bid_qty", "ask_qty"]
+KLINES_COLUMNS = ["timestamp", "close", "realized_vol", "ATR", "vol_regime"]
+
+
+def book_path(processed_dir, symbol: str, date_str: str) -> Path:
+    return Path(processed_dir) / symbol / "bookTicker" / f"{symbol}-bookTicker-{date_str}.parquet"
+
+
+def trades_path(processed_dir, symbol: str, date_str: str) -> Path:
+    return (
+        Path(processed_dir)
+        / symbol
+        / "aggTrades_filtered"
+        / f"{symbol}-aggTrades-{date_str}.parquet"
+    )
+
+
+def klines_path(processed_dir, symbol: str, date_str: str) -> Path:
+    return Path(processed_dir) / symbol / "klines" / f"{symbol}-klines-{date_str}.parquet"
+
+
+def aligned_path(data_dir, symbol: str, date_str: str) -> Path:
+    """Output path. Matches ofi.py's ``aligned_path`` so Stage 5 reads exactly this."""
+    return Path(data_dir) / "aligned" / symbol / f"{symbol}-aligned-{date_str}.parquet"
+
+
+def align_one(processed_dir, data_dir, symbol: str, date_str: str) -> dict:
+    """Align one symbol-day. Never raises; returns a status dict.
+    status in {ok, skipped, missing, too_few_rows, error}."""
+    try:
+        bpath = book_path(processed_dir, symbol, date_str)
+        if not bpath.exists():
+            # Book defines the grid; without it there is nothing to align.
+            return {"status": "missing", "symbol": symbol, "date": date_str}
+
+        dest = aligned_path(data_dir, symbol, date_str)
+        if dest.exists() and dest.stat().st_size > 0:
+            return {"status": "skipped", "symbol": symbol, "date": date_str}
+
+        book_lf = pl.scan_parquet(bpath).select(BOOK_COLUMNS)
+
+        tpath = trades_path(processed_dir, symbol, date_str)
+        if tpath.exists():
+            # rename the wash filter's cleaned-flow columns to the generic names
+            # the transform expects (see build_alignment_engine trade aggregation).
+            trades_lf = pl.scan_parquet(tpath).select(
+                pl.col("timestamp"),
+                pl.col("buy_qty_clean").alias("buy_qty"),
+                pl.col("sell_qty_clean").alias("sell_qty"),
+                pl.col("notional_clean").alias("notional"),
+            )
+        else:
+            trades_lf = pl.LazyFrame(
+                schema={
+                    "timestamp": pl.Datetime("ms"),
+                    "buy_qty": pl.Float64,
+                    "sell_qty": pl.Float64,
+                    "notional": pl.Float64,
+                }
+            )
+
+        kpath = klines_path(processed_dir, symbol, date_str)
+        if kpath.exists():
+            klines_lf = pl.scan_parquet(kpath).select(KLINES_COLUMNS)
+        else:
+            klines_lf = pl.LazyFrame(schema={"timestamp": pl.Datetime("ms"), "close": pl.Float64})
+
+        aligned = build_alignment_engine(book_lf, trades_lf, klines_lf).collect()
+
+        if aligned.height < MIN_OUTPUT_ROWS:
+            logger.warning(
+                "SKIPPED [%s | %s]: only %s aligned rows.", symbol, date_str, aligned.height
+            )
+            return {
+                "status": "too_few_rows",
+                "symbol": symbol,
+                "date": date_str,
+                "rows": aligned.height,
+            }
+
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        aligned.write_parquet(dest, compression="snappy")
+        logger.info("SUCCESS [%s | %s]: %s rows -> %s", symbol, date_str, aligned.height, dest)
+        return {"status": "ok", "symbol": symbol, "date": date_str, "rows": aligned.height}
+    except Exception as exc:  # noqa: BLE001 - workers must never propagate
+        logger.error("FAILED [%s | %s]: %s", symbol, date_str, exc, exc_info=True)
+        return {"status": "error", "symbol": symbol, "date": date_str}
+
+
+def generate_tasks(symbols, start_date, end_date) -> list[tuple[str, str]]:
+    tasks: list[tuple[str, str]] = []
+    delta = timedelta(days=1)
+    for symbol in symbols:
+        current = start_date
+        while current <= end_date:
+            tasks.append((symbol, current.strftime("%Y-%m-%d")))
+            current += delta
+    return tasks
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Stage 3 - align L1 book/trades/klines to a 1-second grid"
+    )
+    parser.add_argument("--symbols", nargs="+", required=True, help="e.g. BTCUSDT ETHUSDT")
+    parser.add_argument("--start", required=True, help="start date YYYY-MM-DD")
+    parser.add_argument("--end", required=True, help="end date YYYY-MM-DD")
+    parser.add_argument("--workers", type=int, default=os.cpu_count(), help="process pool size")
+    parser.add_argument("--processed-dir", default=DEFAULT_PROCESSED_DIR)
+    parser.add_argument(
+        "--data-dir",
+        default=DEFAULT_DATA_DIR,
+        help="root data dir; aligned files go to <data-dir>/aligned/... (default ./data)",
+    )
+    args = parser.parse_args(argv)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] (%(processName)s) %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    start = datetime.strptime(args.start, "%Y-%m-%d").date()
+    end = datetime.strptime(args.end, "%Y-%m-%d").date()
+    if end < start:
+        print(f"error: --end {end} is before --start {start}", file=sys.stderr)
+        return 2
+
+    tasks = generate_tasks(args.symbols, start, end)
+    logger.info("Generated %s alignment tasks across %s workers", len(tasks), args.workers)
+
+    results: dict[str, int] = {}
+    with ProcessPoolExecutor(max_workers=args.workers) as ex:
+        futures = [ex.submit(align_one, args.processed_dir, args.data_dir, s, d) for s, d in tasks]
+        for fut in as_completed(futures):
+            st = fut.result()["status"]
+            results[st] = results.get(st, 0) + 1
+    logger.info("Alignment complete. Summary: %s", results)
+    return 1 if results.get("error", 0) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

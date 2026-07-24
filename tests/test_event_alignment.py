@@ -3,7 +3,9 @@ from datetime import UTC, datetime
 import polars as pl
 import pytest
 
-from order_flow_imbalance_strategy.event_alignment import build_alignment_engine
+from order_flow_imbalance_strategy import event_alignment as EA
+from order_flow_imbalance_strategy.event_alignment import align_one, build_alignment_engine
+from order_flow_imbalance_strategy.ofi import REQUIRED_INPUT_COLUMNS, compute_ofi
 
 T0 = int(datetime(2023, 1, 1, 9, 0, 0, tzinfo=UTC).timestamp() * 1000)
 
@@ -94,3 +96,101 @@ def test_alignment_engine_edge_cases(mock_book_lf, mock_trades_lf, mock_klines_l
     assert result.item(0, "bid_qty") == 10.0
     assert result.item(0, "ask_qty") == 20.0
     assert result.item(10, "bid_qty") == 11.0  # second book update at T0+10s
+
+
+def test_aligned_output_feeds_compute_ofi():
+    """Contract lock: the engine's output must drop straight into ofi.compute_ofi
+    and produce real (non-null) OFI on native adjacent seconds. This is what the
+    old dt_1s grid key silently broke (it nulled every row)."""
+    n = 10  # ten consecutive native book seconds: 09:00:00 .. 09:00:09
+    book = pl.LazyFrame(
+        {
+            "timestamp": [T0 + i * 1000 for i in range(n)],
+            "asset": ["BTCUSDT"] * n,
+            "bid_price": [100.0 + i * 0.1 for i in range(n)],
+            "ask_price": [100.5 + i * 0.1 for i in range(n)],
+            "bid_qty": [10.0 + i for i in range(n)],
+            "ask_qty": [20.0 + i for i in range(n)],
+        }
+    ).with_columns(_TS)
+    trades = pl.LazyFrame(
+        {"timestamp": [T0 + 2000], "buy_qty": [1.0], "sell_qty": [0.0], "notional": [100.0]}
+    ).with_columns(_TS)
+    klines = pl.LazyFrame({"timestamp": [T0], "close": [100.0]}).with_columns(_TS)
+
+    aligned = build_alignment_engine(book, trades, klines).collect()
+
+    # every column ofi.py requires is present, and timestamp is the 1s grid.
+    assert set(REQUIRED_INPUT_COLUMNS) <= set(aligned.columns)
+    assert aligned.schema["timestamp"] == pl.Datetime("ms")
+
+    out = compute_ofi(aligned)
+    assert "ofi_1s" in out.columns
+    # The first n rows are the native seconds; row 0 is OFI warmup (null), the
+    # remaining native seconds compute a real value. Filled/stale rows stay null.
+    native = out.head(n)
+    assert native["ofi_1s"].drop_nulls().len() == n - 1
+    assert out.item(0, "ofi_1s") is None  # warmup
+
+
+def test_align_one_writes_aligned_parquet(tmp_path):
+    """Runner I/O: reads normalized/wash-filtered parquet and writes the exact
+    artifact ofi.py consumes, renaming the wash filter's cleaned-flow columns."""
+    processed = tmp_path / "processed"
+    data = tmp_path / "data"
+    sym, day = "BTCUSDT", "2023-01-01"
+    n = 200
+
+    bp = processed / sym / "bookTicker"
+    bp.mkdir(parents=True)
+    pl.DataFrame(
+        {
+            "timestamp": [T0 + i * 1000 for i in range(n)],
+            "asset": [sym] * n,
+            "bid_price": [100.0] * n,
+            "ask_price": [100.5] * n,
+            "bid_qty": [10.0] * n,
+            "ask_qty": [20.0] * n,
+        }
+    ).with_columns(_TS).write_parquet(bp / f"{sym}-bookTicker-{day}.parquet")
+
+    tp = processed / sym / "aggTrades_filtered"
+    tp.mkdir(parents=True)
+    pl.DataFrame(
+        {
+            "timestamp": [T0 + 1000],
+            "buy_qty_clean": [3.0],
+            "sell_qty_clean": [1.0],
+            "notional_clean": [400.0],
+        }
+    ).with_columns(_TS).write_parquet(tp / f"{sym}-aggTrades-{day}.parquet")
+
+    kp = processed / sym / "klines"
+    kp.mkdir(parents=True)
+    pl.DataFrame(
+        {
+            "timestamp": [T0],
+            "close": [100.0],
+            "realized_vol": [0.2],
+            "ATR": [0.1],
+            "vol_regime": ["normal"],
+        }
+    ).with_columns(_TS).write_parquet(kp / f"{sym}-klines-{day}.parquet")
+
+    res = align_one(str(processed), str(data), sym, day)
+    assert res["status"] == "ok"
+
+    out_path = EA.aligned_path(str(data), sym, day)
+    assert out_path.exists()
+    df = pl.read_parquet(out_path)
+    assert {
+        "timestamp",
+        "bid_price",
+        "ask_price",
+        "bid_qty",
+        "ask_qty",
+        "book_stale",
+        "signed_volume",  # cleaned trade flow flowed through under the generic name
+    } <= set(df.columns)
+    # re-running is idempotent (output already present).
+    assert align_one(str(processed), str(data), sym, day)["status"] == "skipped"
