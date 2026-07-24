@@ -79,19 +79,33 @@ def build_alignment_engine(
     )
 
     # boundary rules: stale quotes, zeroed volumes
+    aligned = aligned.with_columns(
+        [
+            # book_stale: this grid second had NO native book update (its book was
+            # forward-filled from an earlier second). exact_time is the carried
+            # update's time; if its truncated second != this second, the quote is
+            # stale. OFI computed from a stale quote is meaningless, so any fill is
+            # flagged — not just fills older than a fixed tolerance. A null carried
+            # book (before the first update of the day) is stale too.
+            (pl.col("exact_time").dt.truncate("1s") != pl.col("dt_1s"))
+            .fill_null(True)
+            .alias("book_stale"),
+            # gap_prev_s: whole seconds since the last native book update (0 on a
+            # native second, >0 on a forward-filled one). Provenance for OFI/analysis.
+            (pl.col("dt_1s") - pl.col("exact_time").dt.truncate("1s"))
+            .dt.total_seconds()
+            .alias("gap_prev_s"),
+            # trade defaults
+            pl.col("volume").is_null().alias("no_trades"),
+            pl.col("volume").fill_null(0.0),
+            pl.col("signed_volume").fill_null(0.0),
+        ]
+    )
+    # book_stale_prev: the previous grid second was stale (or absent). ofi.py
+    # derives its own t-1 flag internally, but carry it for provenance and parity
+    # with the L2 aligned schema. Grid rows are already in ascending time order.
     return (
-        aligned.with_columns(
-            [
-                # cap forward fill: flag if the exact quote time is > 5s behind current grid second
-                ((pl.col("dt_1s") - pl.col("exact_time")).dt.total_seconds() > 5)
-                .fill_null(True)
-                .alias("book_stale"),
-                # trade defaults
-                pl.col("volume").is_null().alias("no_trades"),
-                pl.col("volume").fill_null(0.0),
-                pl.col("signed_volume").fill_null(0.0),
-            ]
-        )
+        aligned.with_columns(pl.col("book_stale").shift(1).fill_null(True).alias("book_stale_prev"))
         .drop("exact_time")
         # emit the 1-second grid as ``timestamp`` (Datetime) — the key ofi.py sorts
         # on and diffs; the raw book timestamp was dropped above so there is no clash.

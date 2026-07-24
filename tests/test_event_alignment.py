@@ -59,12 +59,23 @@ def test_alignment_engine_edge_cases(mock_book_lf, mock_trades_lf, mock_klines_l
     assert result.item(60, "close") == 105.0
     assert result.item(65, "close") == 105.0
 
-    # book stale flag
+    # book_stale flag: True on ANY forward-filled (non-native) second. Native book
+    # updates land at T0 (idx 0) and T0+10s (idx 10); every second between is filled.
     assert result.item(0, "book_stale") is False
-    assert result.item(5, "book_stale") is False
-    assert result.item(6, "book_stale") is True
+    assert result.item(1, "book_stale") is True
+    assert result.item(5, "book_stale") is True
     assert result.item(9, "book_stale") is True
     assert result.item(10, "book_stale") is False
+
+    # gap_prev_s: whole seconds since the last native update (0 on native seconds).
+    assert result.item(0, "gap_prev_s") == 0
+    assert result.item(5, "gap_prev_s") == 5
+    assert result.item(10, "gap_prev_s") == 0
+
+    # book_stale_prev: whether the previous grid second was stale.
+    assert result.item(1, "book_stale_prev") is False  # prev (idx 0) was native
+    assert result.item(2, "book_stale_prev") is True  # prev (idx 1) was filled
+    assert result.item(10, "book_stale_prev") is True  # prev (idx 9) was filled
 
     # checking trade defaults and vwap
     assert result.item(2, "no_trades") is False
