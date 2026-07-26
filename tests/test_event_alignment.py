@@ -288,7 +288,11 @@ def test_align_one_falls_back_to_raw_trades_with_warning(tmp_path, caplog):
         }
     ).with_columns(_TS).write_parquet(ap / f"{sym}-aggTrades-{day}.parquet")
 
-    with caplog.at_level("WARNING"):
+    # Importing ingest_data (during full-suite collection) runs a dictConfig that
+    # disables sibling loggers, so re-enable ours and capture it by name -- keeps
+    # this assertion independent of test-collection order.
+    EA.logger.disabled = False
+    with caplog.at_level("WARNING", logger="EventAlignment"):
         res = EA.align_one(str(processed), str(data), sym, day)
 
     assert res["status"] == "ok"
