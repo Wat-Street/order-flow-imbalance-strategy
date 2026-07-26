@@ -308,9 +308,14 @@ def aligned_path(data_dir, symbol: str, date_str: str) -> Path:
 
 
 def _load_trades(processed_dir, symbol: str, date_str: str, subdir: str) -> pl.LazyFrame:
-    """Load trades as (timestamp, buy_qty, sell_qty, notional). Reads the wash
-    filter's cleaned-flow columns when present (the default aggTrades_filtered),
-    else the raw normalized names -- so either source works."""
+    """Load trades as (timestamp, buy_qty, sell_qty, notional).
+
+    Reads the configured ``subdir`` (default ``aggTrades_filtered`` -- the wash
+    filter's cleaned flow) and maps its ``*_clean`` columns onto the generic
+    names. If that dir is missing (wash filter not run, or it skipped a thin day),
+    fall back to raw normalized ``aggTrades`` with a loud warning rather than
+    silently dropping every trade; only return an empty frame if neither exists.
+    """
     empty = pl.LazyFrame(
         schema={
             "timestamp": pl.Datetime("ms"),
@@ -321,7 +326,18 @@ def _load_trades(processed_dir, symbol: str, date_str: str, subdir: str) -> pl.L
     )
     p = trades_path(processed_dir, symbol, date_str, subdir)
     if not p.exists():
-        return empty
+        raw = trades_path(processed_dir, symbol, date_str, "aggTrades")
+        if subdir != "aggTrades" and raw.exists():
+            logger.warning(
+                "[%s | %s] trades dir %r missing; falling back to UNWASHED aggTrades "
+                "(run the wash filter first for cleaned flow)",
+                symbol,
+                date_str,
+                subdir,
+            )
+            p = raw
+        else:
+            return empty
     names = pl.scan_parquet(p).collect_schema().names()
     if "buy_qty_clean" in names:
         return pl.scan_parquet(p).select(

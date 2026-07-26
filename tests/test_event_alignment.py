@@ -252,6 +252,51 @@ def test_align_one_writes_full_schema_parquet(tmp_path):
     assert EA.align_one(str(processed), str(data), sym, day)["status"] == "skipped"
 
 
+def test_align_one_falls_back_to_raw_trades_with_warning(tmp_path, caplog):
+    """When the wash-filtered dir is absent, align falls back to raw aggTrades and
+    warns -- rather than silently dropping every trade."""
+    processed = tmp_path / "processed"
+    data = tmp_path / "data"
+    sym, day = "BTCUSDT", "2024-01-01"
+    n = 300
+    day_ms = int(datetime(2024, 1, 1, tzinfo=UTC).timestamp() * 1000)
+
+    bp = processed / sym / "bookTicker"
+    bp.mkdir(parents=True)
+    pl.DataFrame(
+        {
+            "timestamp": [day_ms + i * 1000 for i in range(n)],
+            "bid_price": [100.0] * n,
+            "ask_price": [100.5] * n,
+            "bid_qty": [10.0] * n,
+            "ask_qty": [20.0] * n,
+            "mid_price": [100.25] * n,
+            "spread": [0.5] * n,
+            "queue_imbalance": [-1 / 3] * n,
+        }
+    ).with_columns(_TS).write_parquet(bp / f"{sym}-bookTicker-{day}.parquet")
+
+    # raw normalized aggTrades only -- NO aggTrades_filtered dir.
+    ap = processed / sym / "aggTrades"
+    ap.mkdir(parents=True)
+    pl.DataFrame(
+        {
+            "timestamp": [day_ms + 1000, day_ms + 2000],
+            "buy_qty": [3.0, 0.0],
+            "sell_qty": [0.0, 2.0],
+            "notional": [300.0, 200.0],
+        }
+    ).with_columns(_TS).write_parquet(ap / f"{sym}-aggTrades-{day}.parquet")
+
+    with caplog.at_level("WARNING"):
+        res = EA.align_one(str(processed), str(data), sym, day)
+
+    assert res["status"] == "ok"
+    assert "falling back to UNWASHED" in caplog.text
+    df = pl.read_parquet(EA.aligned_path(str(data), sym, day))
+    assert df.filter(pl.col("trade_count") > 0).height == 2  # both raw trades survived
+
+
 def _fake_aligned(nrows: int = 3) -> pl.DataFrame:
     """Minimal frame that passes validate_aligned (book_dead everywhere, so the
     null level columns are allowed)."""
