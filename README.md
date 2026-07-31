@@ -33,9 +33,14 @@ Use the dev container for a consistent environment (see [CONTRIBUTING.md](CONTRI
 
 ### Multi-horizon fusion
 
-Stage C applies causal exponential filters to spoof-adjusted Stage-B OFI. It preserves the
-input schema, appends `ofi_1m`, `ofi_5m`, and `ofi_15m`, resets after missing/invalid samples,
-and uses the prior day's Stage-B file to avoid an artificial midnight warm-up.
+Stage C turns spoof-adjusted Stage-B `ofi_clean` into three causal, exponentially weighted
+signals: `ofi_1m`, `ofi_5m`, and `ofi_15m`. The shorter signal reacts fastest; the longer
+signals highlight pressure that persists. These columns remain separate so downstream models
+can combine them without losing the individual time scales.
+
+The default configuration uses half-lives of 30, 150, and 450 seconds on a one-second grid.
+Filters reset across timestamp gaps and null signals. When timestamps are contiguous, the prior
+day's Stage-B file warms the filters across midnight. All Stage-B columns are preserved.
 
 ```bash
 ofi-multihorizon-fusion --symbols BTCUSDT ETHUSDT \
@@ -43,4 +48,6 @@ ofi-multihorizon-fusion --symbols BTCUSDT ETHUSDT \
   --config configs/multihorizon_fusion.json
 ```
 
-Existing Stage-C files are skipped unless `--overwrite` is supplied. Writes are atomic.
+Existing Stage-C files are skipped unless `--overwrite` is supplied, missing Stage-B inputs are
+reported in the run summary, and writes are atomic. Run `ofi-multihorizon-fusion --help` for all
+options.

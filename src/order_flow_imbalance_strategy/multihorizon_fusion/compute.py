@@ -19,7 +19,9 @@ FUSION_OUTPUT_COLUMNS: tuple[str, ...] = DEFAULT_CONFIG.output_columns
 
 
 def _validate_input_schema(df: pl.DataFrame, config: FusionConfig) -> None:
-    required = (*REQUIRED_INPUT_COLUMNS, config.timestamp_column, config.signal_column)
+    required = tuple(
+        dict.fromkeys((*REQUIRED_INPUT_COLUMNS, config.timestamp_column, config.signal_column))
+    )
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"input frame missing required columns: {missing}")
@@ -36,9 +38,13 @@ def _validate_input_schema(df: pl.DataFrame, config: FusionConfig) -> None:
     if ts.n_unique() != df.height:
         raise ValueError("timestamp column contains duplicate values")
 
+    numeric_columns = tuple(dict.fromkeys((*REQUIRED_INPUT_COLUMNS, config.signal_column)))
+    nonnumeric = [column for column in numeric_columns if not df[column].dtype.is_numeric()]
+    if nonnumeric:
+        details = ", ".join(f"{column}={df[column].dtype}" for column in nonnumeric)
+        raise ValueError(f"input columns must be numeric: {details}")
+
     signal = df[config.signal_column]
-    if not signal.dtype.is_numeric():
-        raise ValueError(f"signal column must be numeric, got {signal.dtype}")
     non_finite = signal.is_finite().not_() & signal.is_not_null()
     if non_finite.any():
         raise ValueError(f"signal column contains {int(non_finite.sum())} non-finite values")
@@ -81,26 +87,33 @@ def compute_fusion(
     ts = config.timestamp_column
     signal = config.signal_column
 
-    current = df.with_row_index("_current_row").select(
-        ts, signal, "_current_row", pl.lit(True).alias("_is_current")
-    )
+    current = df.select(ts, pl.col(signal).cast(pl.Float64))
     frames = [current]
     if history is not None and not history.is_empty():
         _validate_input_schema(history, config)
-        history_frame = history.select(ts, signal).with_columns(
-            pl.lit(None, dtype=pl.UInt32).alias("_current_row"),
-            pl.lit(False).alias("_is_current"),
-        )
+        if history.schema[ts] != df.schema[ts]:
+            raise ValueError(
+                "history timestamp dtype must match current input "
+                f"({history.schema[ts]} != {df.schema[ts]})"
+            )
+        if not df.is_empty() and history[ts].max() >= df[ts].min():
+            raise ValueError("history timestamps must be strictly earlier than current input")
+        history_frame = history.select(ts, pl.col(signal).cast(pl.Float64))
         frames.insert(0, history_frame)
 
     working = pl.concat(frames).sort(ts)
     if working[ts].n_unique() != working.height:
         raise ValueError("current input and history contain overlapping timestamps")
-    working = working.with_columns(_segment_id_expr(ts, signal, config.grid_seconds))
+    segment_column = "_fusion_segment_id"
+    while segment_column in {ts, signal, *config.output_columns}:
+        segment_column = f"_{segment_column}"
+    working = working.with_columns(
+        _segment_id_expr(ts, signal, config.grid_seconds).alias(segment_column)
+    )
 
     horizon_exprs: list[pl.Expr] = []
     for spec in config.horizons:
-        # Causal EWMA; ``over("_segment_id")`` resets state at time-grid gaps
+        # Causal EWMA; grouping by segment resets state at time-grid gaps
         # and invalid signal samples so discontinuities never bridge horizons.
         horizon_exprs.append(
             pl.col(signal)
@@ -110,20 +123,13 @@ def compute_fusion(
                 min_samples=spec.min_periods,
                 ignore_nulls=True,
             )
-            .over("_segment_id")
+            .over(segment_column)
             .alias(spec.column)
         )
 
-    fused = (
-        working.with_columns(horizon_exprs)
-        .filter("_is_current")
-        .sort("_current_row")
-        .select("_current_row", *config.output_columns)
-    )
+    fused = working.with_columns(horizon_exprs).select(ts, *config.output_columns)
     return (
-        df.with_row_index("_current_row")
-        .join(fused, on="_current_row", how="left", validate="1:1")
-        .drop("_current_row")
+        df.join(fused, on=ts, how="left", validate="1:1")
         .sort(ts)
         .select(*original_columns, *config.output_columns)
     )
@@ -140,6 +146,12 @@ def validate_fusion(
     if output_df.height != input_df.height:
         problems.append(f"row count {output_df.height} != input {input_df.height}")
 
+    expected_columns = [*input_df.columns, *config.output_columns]
+    if output_df.columns != expected_columns:
+        problems.append(
+            f"output schema must preserve input columns and append horizons: {expected_columns}"
+        )
+
     expected_input = input_df.sort(config.timestamp_column)
     for col in input_df.columns:
         if col not in output_df.columns:
@@ -152,20 +164,33 @@ def validate_fusion(
     if missing_outputs:
         problems.append(f"missing fusion output columns: {missing_outputs}")
 
-    spoof = input_df["spoof_score"]
-    if not spoof.dtype.is_numeric():
-        problems.append(f"spoof_score must be numeric, got {spoof.dtype}")
-    else:
+    validated_input_columns = tuple(dict.fromkeys((*REQUIRED_INPUT_COLUMNS, config.signal_column)))
+    for col in validated_input_columns:
+        if col not in input_df.columns:
+            problems.append(f"missing required input column {col!r}")
+            continue
+        series = input_df[col]
+        if not series.dtype.is_numeric():
+            problems.append(f"{col} must be numeric, got {series.dtype}")
+            continue
+        non_finite = series.is_finite().not_() & series.is_not_null()
+        if non_finite.any():
+            problems.append(f"{int(non_finite.sum())} non-finite {col} values (inf/NaN)")
+
+    if "spoof_score" in input_df.columns and input_df["spoof_score"].dtype.is_numeric():
+        spoof = input_df["spoof_score"]
         spoof_finite = spoof.is_finite() & spoof.is_not_null()
-        if spoof_finite.any():
-            out_of_range = spoof_finite & ((spoof < 0.0) | (spoof > 1.0))
-            if out_of_range.any():
-                problems.append(f"{int(out_of_range.sum())} spoof_score values outside [0, 1]")
+        out_of_range = spoof_finite & ((spoof < 0.0) | (spoof > 1.0))
+        if out_of_range.any():
+            problems.append(f"{int(out_of_range.sum())} spoof_score values outside [0, 1]")
 
     for col in config.output_columns:
         if col not in output_df.columns:
             continue
         series = output_df[col]
+        if not series.dtype.is_numeric():
+            problems.append(f"{col} must be numeric, got {series.dtype}")
+            continue
         non_finite = series.is_finite().not_() & series.is_not_null()
         if non_finite.any():
             problems.append(f"{int(non_finite.sum())} non-finite {col} values (inf/NaN)")

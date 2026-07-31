@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any
 
 import polars as pl
@@ -21,12 +23,24 @@ from order_flow_imbalance_strategy.multihorizon_fusion.config import (
     load_config,
 )
 
+SYMBOL_PATTERN = re.compile(r"[A-Z0-9]+")
+
 
 def parse_date(value: str) -> date:
     try:
         return datetime.strptime(value, "%Y-%m-%d").date()
     except ValueError as exc:
         raise argparse.ArgumentTypeError(f"invalid date {value!r}, expected YYYY-MM-DD") from exc
+
+
+def parse_symbol(value: str) -> str:
+    """Normalize a Binance symbol and reject values that could escape the data directory."""
+    symbol = value.strip().upper()
+    if not SYMBOL_PATTERN.fullmatch(symbol):
+        raise argparse.ArgumentTypeError(
+            f"invalid symbol {value!r}; expected letters and numbers only"
+        )
+    return symbol
 
 
 def daterange(start: date, end: date) -> list[date]:
@@ -53,13 +67,11 @@ def build_tasks(
     end: date,
     data_dir: Path,
 ) -> list[dict[str, Any]]:
-    """Build the full task list upfront (only days whose ofi-B input exists)."""
+    """Build every requested symbol-day task so missing inputs are reported."""
     tasks: list[dict[str, Any]] = []
-    for symbol in symbols:
+    for symbol in dict.fromkeys(symbols):
         for day in daterange(start, end):
             in_path = input_path(data_dir, symbol, day)
-            if not in_path.exists():
-                continue
             tasks.append(
                 {
                     "symbol": symbol,
@@ -78,16 +90,16 @@ def process_file(task: dict[str, Any]) -> dict[str, Any]:
     Never raises; always returns a status dict so a single bad day cannot crash
     the pool. ``status`` is one of ``ok``, ``skipped``, ``no_input``, ``error``.
     """
-    symbol = task["symbol"]
-    day = task["date"]
-    in_path = Path(task["in_path"])
-    out_path = Path(task["out_path"])
-    config_path = task.get("config_path")
-    prior_path = Path(task["history_path"]) if task.get("history_path") else None
-    overwrite = bool(task.get("overwrite", False))
+    symbol = str(task.get("symbol", "<unknown>"))
+    day = str(task.get("date", "<unknown>"))
     status: dict[str, Any] = {"symbol": symbol, "date": day, "status": "error"}
 
     try:
+        in_path = Path(task["in_path"])
+        out_path = Path(task["out_path"])
+        prior_path = Path(task["history_path"]) if task.get("history_path") else None
+        overwrite = bool(task.get("overwrite", False))
+
         if out_path.exists() and not overwrite:
             status["status"] = "skipped"
             status["message"] = "output already exists"
@@ -98,7 +110,9 @@ def process_file(task: dict[str, Any]) -> dict[str, Any]:
             status["message"] = f"missing input {in_path}"
             return status
 
-        config: FusionConfig = load_config(Path(config_path)) if config_path else DEFAULT_CONFIG
+        config = task.get("config", DEFAULT_CONFIG)
+        if not isinstance(config, FusionConfig):
+            raise TypeError("task config must be a FusionConfig")
 
         df = pl.read_parquet(in_path)
         history = pl.read_parquet(prior_path) if prior_path and prior_path.is_file() else None
@@ -115,7 +129,13 @@ def process_file(task: dict[str, Any]) -> dict[str, Any]:
             stats[f"mean_{col}"] = None if mean is None else float(mean)
 
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+        with NamedTemporaryFile(
+            dir=out_path.parent,
+            prefix=f".{out_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as tmp_file:
+            tmp_path = Path(tmp_file.name)
         try:
             out.write_parquet(tmp_path, compression="snappy")
             tmp_path.replace(out_path)
@@ -139,7 +159,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Stage 7 - multi-horizon exponential fusion of spoof-adjusted OFI (ofi-B -> ofi-C)"
         )
     )
-    parser.add_argument("--symbols", nargs="+", required=True, help="e.g. BTCUSDT ETHUSDT")
+    parser.add_argument(
+        "--symbols",
+        nargs="+",
+        required=True,
+        type=parse_symbol,
+        help="e.g. BTCUSDT ETHUSDT",
+    )
     parser.add_argument("--start", type=parse_date, required=True, help="start date YYYY-MM-DD")
     parser.add_argument("--end", type=parse_date, required=True, help="end date YYYY-MM-DD")
     parser.add_argument("--workers", type=int, default=4, help="process pool size (default 4)")
@@ -181,28 +207,58 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    config_path = str(args.config) if args.config else None
-
     tasks = build_tasks(args.symbols, args.start, args.end, args.data_dir)
     if not tasks:
         print("No ofi-B input files found for the requested symbols/range.")
         return 0
 
     for task in tasks:
-        task["config_path"] = config_path
+        task["config"] = config
         task["overwrite"] = args.overwrite
 
     counts: Counter[str] = Counter()
     failures: list[dict[str, Any]] = []
+    runnable_tasks: list[dict[str, Any]] = []
+    for task in tasks:
+        input_exists = Path(task["in_path"]).is_file()
+        output_can_skip = Path(task["out_path"]).is_file() and not args.overwrite
+        if not input_exists and not output_can_skip:
+            counts["no_input"] += 1
+        else:
+            runnable_tasks.append(task)
 
-    with ProcessPoolExecutor(max_workers=args.workers) as pool:
-        futures = {pool.submit(process_file, task): task for task in tasks}
+    if runnable_tasks:
         desc = f"Fusion ({', '.join(config.output_columns)})"
-        for future in tqdm(as_completed(futures), total=len(tasks), desc=desc, unit="day"):
-            result = future.result()
+
+        def record_result(result: dict[str, Any]) -> None:
             counts[result["status"]] += 1
             if result["status"] == "error":
                 failures.append(result)
+
+        if args.workers == 1:
+            for task in tqdm(runnable_tasks, desc=desc, unit="day"):
+                record_result(process_file(task))
+        else:
+            try:
+                with ProcessPoolExecutor(max_workers=args.workers) as pool:
+                    futures = {pool.submit(process_file, task): task for task in runnable_tasks}
+                    for future in tqdm(
+                        as_completed(futures), total=len(runnable_tasks), desc=desc, unit="day"
+                    ):
+                        task = futures[future]
+                        try:
+                            result = future.result()
+                        except Exception as exc:  # noqa: BLE001 - failure is isolated by task
+                            result = {
+                                "symbol": task["symbol"],
+                                "date": task["date"],
+                                "status": "error",
+                                "message": f"worker failed: {type(exc).__name__}: {exc}",
+                            }
+                        record_result(result)
+            except Exception as exc:  # noqa: BLE001 - report process-pool setup failures cleanly
+                print(f"error: process pool failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+                return 1
 
     print("\nSummary:")
     for status in ("ok", "skipped", "no_input", "error"):
