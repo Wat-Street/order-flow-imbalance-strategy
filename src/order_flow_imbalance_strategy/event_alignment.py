@@ -130,6 +130,11 @@ def build_alignment_engine(
     update. Returns a LazyFrame keyed on ``timestamp`` -- the column ofi.py sorts
     on and diffs to detect gaps.
     """
+
+    book_lf = book_lf.with_columns(pl.col("timestamp").dt.replace_time_zone(None))
+    trades_lf = trades_lf.with_columns(pl.col("timestamp").dt.replace_time_zone(None))
+    klines_lf = klines_lf.with_columns(pl.col("timestamp").dt.replace_time_zone(None))
+
     # --- book (level): last update per interval; keep exact time for staleness --
     book = (
         book_lf.with_columns(
