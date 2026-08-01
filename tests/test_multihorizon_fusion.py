@@ -7,6 +7,7 @@ from pathlib import Path
 import polars as pl
 import pytest
 
+from order_flow_imbalance_strategy import ofi as ofi_module
 from order_flow_imbalance_strategy.multihorizon_fusion.cli import (
     build_tasks,
     daterange,
@@ -17,6 +18,7 @@ from order_flow_imbalance_strategy.multihorizon_fusion.cli import (
 )
 from order_flow_imbalance_strategy.multihorizon_fusion.compute import (
     FUSION_OUTPUT_COLUMNS,
+    STAGE_B_REQUIRED_COLUMNS,
     compute_fusion,
     validate_fusion,
 )
@@ -57,6 +59,14 @@ def fuse(rows: list[dict], config: FusionConfig = DEFAULT_CONFIG) -> pl.DataFram
     return compute_fusion(make_signal_frame(rows), config)
 
 
+def uniform_config(half_life_seconds: float, min_periods: int) -> FusionConfig:
+    return FusionConfig(
+        horizons=tuple(
+            HorizonSpec(column, half_life_seconds, min_periods) for column in FUSION_OUTPUT_COLUMNS
+        )
+    )
+
+
 # --- compute -----------------------------------------------------------------
 
 
@@ -88,30 +98,62 @@ def test_horizon_warmup_rows_are_null():
 
 
 def test_ewma_matches_known_half_life_values():
-    config = FusionConfig(horizons=(HorizonSpec("h", half_life_seconds=1, min_periods=1),))
+    config = uniform_config(half_life_seconds=1, min_periods=1)
     out = fuse([{"ofi_clean": 0.0}, {"ofi_clean": 1.0}, {"ofi_clean": 0.0}], config)
 
-    assert out["h"].to_list() == pytest.approx([0.0, 0.5, 0.25])
+    assert out["ofi_1m"].to_list() == pytest.approx([0.0, 0.5, 0.25])
 
 
 def test_fusion_is_causal():
-    config = FusionConfig(horizons=(HorizonSpec("h", half_life_seconds=2, min_periods=1),))
+    config = uniform_config(half_life_seconds=2, min_periods=1)
     rows = [{"ofi_clean": float(value)} for value in (0, 1, 2, 100, -100)]
 
     full = fuse(rows, config)
     prefix = fuse(rows[:3], config)
 
-    assert full["h"].head(3).equals(prefix["h"])
+    assert full["ofi_1m"].head(3).equals(prefix["ofi_1m"])
 
 
 def test_all_three_horizon_columns_appended():
-    src = make_signal_frame([{"ofi_clean": 1.0}] * 1000)
+    src = make_signal_frame([{"ofi_clean": 1.0}] * 1000).with_columns(
+        pl.lit("preserve me").alias("spoof_diagnostic")
+    )
     out = compute_fusion(src)
+
     assert out.height == src.height
-    for col in src.columns:
-        assert col in out.columns
-    for col in FUSION_OUTPUT_COLUMNS:
-        assert col in out.columns
+    assert out.columns == [*src.columns, *FUSION_OUTPUT_COLUMNS]
+    assert out.select(src.columns).equals(src)
+
+
+def test_stage_b_contract_extends_real_stage_a_output_by_spoof_fields():
+    assert STAGE_B_REQUIRED_COLUMNS == (
+        "timestamp",
+        *ofi_module.OUTPUT_COLUMNS,
+        "spoof_score",
+        "ofi_clean",
+    )
+
+    rows = 40
+    aligned = pl.DataFrame(
+        {
+            "timestamp": [T0 + timedelta(seconds=i) for i in range(rows)],
+            "bid_price": [100.0] * rows,
+            "ask_price": [101.0] * rows,
+            "bid_qty": [float(i + 1) for i in range(rows)],
+            "ask_qty": [1.0] * rows,
+        }
+    )
+    stage_a = ofi_module.compute_ofi(aligned)
+    stage_b = stage_a.with_columns(
+        pl.lit(0.25).alias("spoof_score"),
+        (pl.col("ofi_1s") * 0.75).alias("ofi_clean"),
+    )
+
+    stage_c = compute_fusion(stage_b)
+
+    assert stage_c.columns == [*stage_b.columns, *FUSION_OUTPUT_COLUMNS]
+    assert stage_c.select(stage_b.columns).equals(stage_b)
+    assert stage_c.height == stage_b.height
 
 
 def test_empty_input_preserves_schema_and_adds_horizons():
@@ -124,7 +166,7 @@ def test_empty_input_preserves_schema_and_adds_horizons():
     assert all(out.schema[column] == pl.Float64 for column in FUSION_OUTPUT_COLUMNS)
 
 
-def test_unsorted_input_is_sorted_by_timestamp():
+def test_unsorted_spoofing_output_is_rejected_instead_of_reordered():
     src = make_signal_frame(
         [
             {"ofi_clean": 1.0},
@@ -133,8 +175,8 @@ def test_unsorted_input_is_sorted_by_timestamp():
         ]
     )
     shuffled = src.sort("timestamp", descending=True)
-    out = compute_fusion(shuffled)
-    assert out["timestamp"].is_sorted()
+    with pytest.raises(ValueError, match="sorted in ascending order"):
+        compute_fusion(shuffled)
 
 
 def test_gap_resets_horizon_state():
@@ -329,14 +371,16 @@ def test_load_config_from_json(tmp_path: Path):
         """
         {
           "horizons": [
-            {"column": "ofi_1m", "half_life_seconds": 20, "min_periods": 10}
+            {"column": "ofi_1m", "half_life_seconds": 20, "min_periods": 10},
+            {"column": "ofi_5m", "half_life_seconds": 150, "min_periods": 150},
+            {"column": "ofi_15m", "half_life_seconds": 450, "min_periods": 450}
           ]
         }
         """,
         encoding="utf-8",
     )
     cfg = load_config(cfg_path)
-    assert len(cfg.horizons) == 1
+    assert len(cfg.horizons) == 3
     assert cfg.horizons[0].column == "ofi_1m"
     assert cfg.horizons[0].half_life_seconds == 20.0
 
@@ -350,6 +394,24 @@ def test_default_config_json_loads():
 def test_horizon_spec_rejects_invalid_half_life():
     with pytest.raises(ValueError, match="half_life_seconds"):
         HorizonSpec(column="x", half_life_seconds=0.0, min_periods=1)
+
+
+def test_fusion_config_requires_exactly_three_contract_columns():
+    with pytest.raises(ValueError, match="horizon columns must be exactly"):
+        FusionConfig(horizons=(HorizonSpec("custom", 1, 1),))
+
+
+@pytest.mark.parametrize(
+    "overrides, expected_error",
+    [
+        ({"signal_column": "other"}, "signal_column must be 'ofi_clean'"),
+        ({"timestamp_column": "time"}, "timestamp_column must be 'timestamp'"),
+        ({"grid_seconds": 2}, "grid_seconds must be 1"),
+    ],
+)
+def test_fusion_config_locks_stage_b_contract(overrides: dict, expected_error: str):
+    with pytest.raises(ValueError, match=expected_error):
+        FusionConfig(horizons=DEFAULT_CONFIG.horizons, **overrides)
 
 
 @pytest.mark.parametrize(
@@ -418,8 +480,8 @@ def test_process_file_writes_and_is_idempotent(tmp_path: Path):
 
     written = pl.read_parquet(out_path)
     assert written.height == 1000
-    assert "ofi_1m" in written.columns
-    assert written["ofi_1s"][0] == pytest.approx(7.0)
+    assert written.columns == [*src.columns, *FUSION_OUTPUT_COLUMNS]
+    assert written.select(src.columns).equals(src)
 
     r2 = process_file(task)
     assert r2["status"] == "skipped"

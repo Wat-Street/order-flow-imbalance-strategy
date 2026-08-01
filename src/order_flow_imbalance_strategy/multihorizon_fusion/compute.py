@@ -4,29 +4,36 @@ import polars as pl
 
 from order_flow_imbalance_strategy.multihorizon_fusion.config import (
     DEFAULT_CONFIG,
+    FUSION_OUTPUT_COLUMNS,
+    FUSION_SIGNAL_COLUMN,
+    FUSION_TIMESTAMP_COLUMN,
     FusionConfig,
 )
+from order_flow_imbalance_strategy.ofi import OUTPUT_COLUMNS as STAGE_A_OUTPUT_COLUMNS
 
-#: Columns that must be present in an ``ofi-B`` input frame.
-REQUIRED_INPUT_COLUMNS: tuple[str, ...] = (
-    "ofi_1s",
-    "bid_contribution",
-    "ask_contribution",
+#: Stage B preserves Stage-A OFI outputs and appends the spoof-adjustment fields.
+STAGE_B_REQUIRED_COLUMNS: tuple[str, ...] = (
+    FUSION_TIMESTAMP_COLUMN,
+    *STAGE_A_OUTPUT_COLUMNS,
     "spoof_score",
+    FUSION_SIGNAL_COLUMN,
+)
+STAGE_B_NUMERIC_COLUMNS: tuple[str, ...] = (
+    *STAGE_A_OUTPUT_COLUMNS,
+    "spoof_score",
+    FUSION_SIGNAL_COLUMN,
 )
 
-FUSION_OUTPUT_COLUMNS: tuple[str, ...] = DEFAULT_CONFIG.output_columns
+#: Backwards-compatible name for callers that imported the original constant.
+REQUIRED_INPUT_COLUMNS: tuple[str, ...] = STAGE_B_REQUIRED_COLUMNS
 
 
 def _validate_input_schema(df: pl.DataFrame, config: FusionConfig) -> None:
-    required = tuple(
-        dict.fromkeys((*REQUIRED_INPUT_COLUMNS, config.timestamp_column, config.signal_column))
-    )
-    missing = [c for c in required if c not in df.columns]
+    missing = [column for column in STAGE_B_REQUIRED_COLUMNS if column not in df.columns]
     if missing:
         raise ValueError(f"input frame missing required columns: {missing}")
 
-    conflicting = [c for c in config.output_columns if c in df.columns]
+    conflicting = [column for column in FUSION_OUTPUT_COLUMNS if column in df.columns]
     if conflicting:
         raise ValueError(f"input frame already contains fusion output columns: {conflicting}")
 
@@ -37,9 +44,10 @@ def _validate_input_schema(df: pl.DataFrame, config: FusionConfig) -> None:
         raise ValueError("timestamp column contains null values")
     if ts.n_unique() != df.height:
         raise ValueError("timestamp column contains duplicate values")
+    if not ts.is_sorted():
+        raise ValueError("timestamp column must be sorted in ascending order")
 
-    numeric_columns = tuple(dict.fromkeys((*REQUIRED_INPUT_COLUMNS, config.signal_column)))
-    nonnumeric = [column for column in numeric_columns if not df[column].dtype.is_numeric()]
+    nonnumeric = [column for column in STAGE_B_NUMERIC_COLUMNS if not df[column].dtype.is_numeric()]
     if nonnumeric:
         details = ", ".join(f"{column}={df[column].dtype}" for column in nonnumeric)
         raise ValueError(f"input columns must be numeric: {details}")
@@ -73,13 +81,13 @@ def compute_fusion(
 ) -> pl.DataFrame:
     """Append multi-horizon exponentially decayed aggregates of ``ofi_clean``.
 
-    Returns a new frame with every original column preserved (same order, same
-    row count) plus one column per configured horizon. ``ofi_1s`` and all other
-    input columns are copied verbatim — fusion reads only ``ofi_clean``.
+    Returns a new frame with every original row and column preserved in the same
+    order, followed by one column per configured horizon. ``ofi_1s`` and all
+    other input columns are copied verbatim — fusion reads only ``ofi_clean``.
 
     ``history`` may contain preceding rows (normally the previous day) used to
-    warm the causal filters without being emitted. The current input is sorted
-    by timestamp in the result.
+    warm the causal filters without being emitted. Stage-B timestamps must
+    already be sorted; fusion never reorders the current input.
     """
     _validate_input_schema(df, config)
 
@@ -128,10 +136,8 @@ def compute_fusion(
         )
 
     fused = working.with_columns(horizon_exprs).select(ts, *config.output_columns)
-    return (
-        df.join(fused, on=ts, how="left", validate="1:1")
-        .sort(ts)
-        .select(*original_columns, *config.output_columns)
+    return df.join(fused, on=ts, how="left", validate="1:1").select(
+        *original_columns, *config.output_columns
     )
 
 
@@ -152,20 +158,18 @@ def validate_fusion(
             f"output schema must preserve input columns and append horizons: {expected_columns}"
         )
 
-    expected_input = input_df.sort(config.timestamp_column)
     for col in input_df.columns:
         if col not in output_df.columns:
             problems.append(f"missing preserved input column {col!r}")
             continue
-        if not expected_input[col].equals(output_df[col]):
+        if not input_df[col].equals(output_df[col]):
             problems.append(f"input column {col!r} was modified during fusion")
 
     missing_outputs = [c for c in config.output_columns if c not in output_df.columns]
     if missing_outputs:
         problems.append(f"missing fusion output columns: {missing_outputs}")
 
-    validated_input_columns = tuple(dict.fromkeys((*REQUIRED_INPUT_COLUMNS, config.signal_column)))
-    for col in validated_input_columns:
+    for col in STAGE_B_NUMERIC_COLUMNS:
         if col not in input_df.columns:
             problems.append(f"missing required input column {col!r}")
             continue

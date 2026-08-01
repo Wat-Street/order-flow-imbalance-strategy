@@ -38,9 +38,20 @@ signals: `ofi_1m`, `ofi_5m`, and `ofi_15m`. The shorter signal reacts fastest; t
 signals highlight pressure that persists. These columns remain separate so downstream models
 can combine them without losing the individual time scales.
 
+The input contract is `data/signals/{SYMBOL}/{SYMBOL}-ofi-B-{date}.parquet`. The upstream
+spoof-adjustment stage must preserve the Stage-A columns produced by `ofi.py`, append numeric
+`spoof_score` and `ofi_clean` columns, and keep timestamps unique and sorted. Stage C returns
+the identical Stage-B rows, column order, and values followed by exactly `ofi_1m`, `ofi_5m`,
+and `ofi_15m`.
+
+The Stage-B spoof-adjustment producer is not yet present in this repository.
+`filter_wash_trades.py` is an earlier trade-cleaning stage and does not emit the Stage-B schema.
+
 The default configuration uses half-lives of 30, 150, and 450 seconds on a one-second grid.
 Filters reset across timestamp gaps and null signals. When timestamps are contiguous, the prior
-day's Stage-B file warms the filters across midnight. All Stage-B columns are preserved.
+day's Stage-B file warms the filters across midnight. All Stage-B columns are preserved. Custom
+configuration may tune half-lives and warm-up periods, but the one-second Stage-B input contract
+and the three Stage-C output column names are fixed.
 
 ```bash
 ofi-multihorizon-fusion --symbols BTCUSDT ETHUSDT \

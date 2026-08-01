@@ -7,6 +7,11 @@ from numbers import Real
 from pathlib import Path
 from typing import Any
 
+FUSION_OUTPUT_COLUMNS: tuple[str, ...] = ("ofi_1m", "ofi_5m", "ofi_15m")
+FUSION_SIGNAL_COLUMN = "ofi_clean"
+FUSION_TIMESTAMP_COLUMN = "timestamp"
+FUSION_GRID_SECONDS = 1
+
 
 def _validate_column_name(value: object, label: str) -> str:
     if not isinstance(value, str) or not value.strip():
@@ -43,9 +48,9 @@ class FusionConfig:
     """Full fusion configuration."""
 
     horizons: tuple[HorizonSpec, ...]
-    signal_column: str = "ofi_clean"
-    timestamp_column: str = "timestamp"
-    grid_seconds: int = 1
+    signal_column: str = FUSION_SIGNAL_COLUMN
+    timestamp_column: str = FUSION_TIMESTAMP_COLUMN
+    grid_seconds: int = FUSION_GRID_SECONDS
 
     def __post_init__(self) -> None:
         if not isinstance(self.horizons, tuple) or not all(
@@ -62,9 +67,19 @@ class FusionConfig:
         _validate_column_name(self.timestamp_column, "timestamp_column")
         if self.signal_column == self.timestamp_column:
             raise ValueError("signal_column and timestamp_column must be different")
+        if self.signal_column != FUSION_SIGNAL_COLUMN:
+            raise ValueError(f"signal_column must be {FUSION_SIGNAL_COLUMN!r}")
+        if self.timestamp_column != FUSION_TIMESTAMP_COLUMN:
+            raise ValueError(f"timestamp_column must be {FUSION_TIMESTAMP_COLUMN!r}")
+        if self.grid_seconds != FUSION_GRID_SECONDS:
+            raise ValueError(f"grid_seconds must be {FUSION_GRID_SECONDS}")
         columns = [h.column for h in self.horizons]
         if len(columns) != len(set(columns)):
             raise ValueError(f"duplicate horizon column names: {columns}")
+        if tuple(columns) != FUSION_OUTPUT_COLUMNS:
+            raise ValueError(
+                f"horizon columns must be exactly {list(FUSION_OUTPUT_COLUMNS)}, got {columns}"
+            )
         reserved = {self.signal_column, self.timestamp_column}
         collisions = sorted(reserved.intersection(columns))
         if collisions:
@@ -136,9 +151,9 @@ def load_config(path: Path | None = None) -> FusionConfig:
     try:
         return FusionConfig(
             horizons=tuple(_horizon_from_dict(h, i) for i, h in enumerate(horizons_raw)),
-            signal_column=data.get("signal_column", "ofi_clean"),
-            timestamp_column=data.get("timestamp_column", "timestamp"),
-            grid_seconds=data.get("grid_seconds", 1),
+            signal_column=data.get("signal_column", FUSION_SIGNAL_COLUMN),
+            timestamp_column=data.get("timestamp_column", FUSION_TIMESTAMP_COLUMN),
+            grid_seconds=data.get("grid_seconds", FUSION_GRID_SECONDS),
         )
     except ValueError as exc:
         raise ValueError(f"{path}: {exc}") from exc
