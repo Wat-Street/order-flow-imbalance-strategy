@@ -26,6 +26,9 @@ pip install -e ".[dev]"
 chmod +x scripts/check.sh
 ```
 
+The default test run excludes live network tests so development and CI stay deterministic.
+Run them explicitly with `pytest -m network -o addopts=''` when validating Binance access.
+
 ## Pull requests
 
 - Clear title and a short description of what changed
