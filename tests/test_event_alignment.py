@@ -137,6 +137,25 @@ def test_unbounded_carry_when_horizon_disabled(mock_book_lf, mock_trades_lf, moc
     assert _at(result, 6)["book_stale"] is True  # still a fill
 
 
+def test_tz_aware_inputs_align_identically_to_naive(mock_book_lf, mock_trades_lf, mock_klines_lf):
+    """Regression: a UTC-tagged input timestamp (Datetime('ms','UTC')) must align
+    to the SAME result as the tz-naive Stage-2 contract. The engine strips the tz
+    at its boundary, so a tz-aware upstream neither raises a join dtype mismatch
+    (naive grid vs tz-aware key) nor shifts the wall-clock."""
+    naive = build_alignment_engine(mock_book_lf, mock_trades_lf, mock_klines_lf, day=DAY).collect()
+
+    def to_utc(lf):
+        return lf.with_columns(pl.col("timestamp").dt.replace_time_zone("UTC"))
+
+    aware = build_alignment_engine(
+        to_utc(mock_book_lf), to_utc(mock_trades_lf), to_utc(mock_klines_lf), day=DAY
+    ).collect()
+
+    # identical output, and the emitted grid key stays tz-naive (ofi.py's contract).
+    assert aware.equals(naive)
+    assert aware.schema["timestamp"] == pl.Datetime("ms")
+
+
 def test_aligned_output_feeds_compute_ofi():
     """Contract lock: the engine's output drops straight into ofi.compute_ofi and
     yields real (non-null) OFI on native adjacent seconds -- what the old dt_1s
