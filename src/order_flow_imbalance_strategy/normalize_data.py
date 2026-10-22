@@ -177,7 +177,7 @@ def execute_normalization(task):
 
     try:
         # scan the raw data and call corresponding function
-        lf = pl.scan_csv(raw_path, has_header=True, rechunk=False)
+        lf = pl.scan_csv(raw_path, has_header=True)
 
         if data_type == "bookTicker":
             processed_lf = process_book_ticker(lf, symbol)

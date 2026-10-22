@@ -85,7 +85,7 @@ def generate_tasks(symbols, start_date, end_date, raw_dir, processed_dir):
 
 def scan_klines_csv(raw_path: str | Path) -> pl.LazyFrame:
     """Binance klines CSVs from ingest include a header row."""
-    return pl.scan_csv(raw_path, has_header=True, rechunk=False)
+    return pl.scan_csv(raw_path, has_header=True)
 
 
 def load_day_with_context(raw_path: Path, raw_dir: Path, symbol: str, day: date) -> pl.LazyFrame:
