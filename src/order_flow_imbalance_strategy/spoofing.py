@@ -29,13 +29,23 @@
 #       ``book_stale`` does not restart it -- a carried quote is a quiet book, not a
 #       broken feed, and those seconds are already unidentifiable.
 #
+# Scoring (per side): how unusual is this second's removal against its baseline?
+#   * z = (removal - prior_median) / (prior_std + eps); eps keeps a flat history
+#       (std 0) finite -- there, any excess over the median scores as maximal.
+#   * score = clip((z - z_floor) / (z_cap - z_floor), 0, 1): 0 up to z_floor,
+#       1 from z_cap. Null removal or baseline -> null score, never 0.
+# Window and thresholds live in a frozen ``SpoofConfig``; pick them on selection
+# data, then evaluate that exact config (``fingerprint()``) on untouched data.
+#
 # Known limitation: the aligned frame zero-fills flow on seconds without trades
 # and has no flag for a missing trade feed, so a feed outage reads as "no trades"
 # and its depletion as unexplained.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import hashlib
+import json
+from dataclasses import asdict, dataclass
 
 import polars as pl
 
@@ -74,16 +84,44 @@ STATS_OUTPUT_COLUMNS: tuple[str, ...] = (
     "ask_prior_std",
 )
 
+#: Columns that must be present to score.
+SCORE_INPUT_COLUMNS: tuple[str, ...] = tuple(
+    f"{side}_{c}" for side in ("bid", "ask") for c in ("removal", "prior_median", "prior_std")
+)
+
+#: Columns appended by :func:`side_scores`.
+SCORE_OUTPUT_COLUMNS: tuple[str, ...] = ("bid_z", "bid_score", "ask_z", "ask_score")
+
 
 @dataclass(frozen=True)
 class SpoofConfig:
-    """Scoring parameters. Frozen so a run's settings can't drift mid-evaluation."""
+    """Scoring parameters. Frozen so a run's settings can't drift mid-evaluation;
+    bump ``version`` whenever a choice is re-made."""
 
+    version: str = "l1-depletion-v1"
     window_s: int = 3600
     min_obs: int = 2
+    z_floor: float = 2.0
+    z_cap: float = 6.0
+    eps: float = 1e-8
+
+    def __post_init__(self) -> None:
+        if self.window_s < 1:
+            raise ValueError(f"window_s must be >= 1, got {self.window_s}")
+        if self.min_obs < 2:
+            raise ValueError(f"min_obs must be >= 2 (a sample std needs two), got {self.min_obs}")
+        if self.z_cap <= self.z_floor:
+            raise ValueError(f"z_cap ({self.z_cap}) must exceed z_floor ({self.z_floor})")
+        if self.eps <= 0:
+            raise ValueError(f"eps must be > 0, got {self.eps}")
+
+    def fingerprint(self) -> str:
+        """Short, stable id of these exact settings, for stamping outputs."""
+        payload = json.dumps(asdict(self), sort_keys=True).encode()
+        return hashlib.sha256(payload).hexdigest()[:12]
 
 
-#: The production settings (window 3600s, min_obs 2).
+#: The production settings (window 3600s, min_obs 2, ramp z 2..6).
 DEFAULT_CONFIG = SpoofConfig()
 
 
@@ -167,6 +205,24 @@ def trailing_stats(df: pl.DataFrame, cfg: SpoofConfig = DEFAULT_CONFIG) -> pl.Da
         )
 
     return df.select(*original_columns, *STATS_OUTPUT_COLUMNS)
+
+
+def side_scores(df: pl.DataFrame, cfg: SpoofConfig = DEFAULT_CONFIG) -> pl.DataFrame:
+    """Add each side's z-score and bounded [0, 1] suspicion score.
+
+    Expects :func:`trailing_stats` output. Returns every original column unchanged
+    plus ``SCORE_OUTPUT_COLUMNS``; any null input gives a null z and score.
+    """
+    _check_columns(df, SCORE_INPUT_COLUMNS, SCORE_OUTPUT_COLUMNS)
+
+    for side in ("bid", "ask"):
+        z = (pl.col(f"{side}_removal") - pl.col(f"{side}_prior_median")) / (
+            pl.col(f"{side}_prior_std") + cfg.eps
+        )
+        df = df.with_columns(z.alias(f"{side}_z"))
+        ramp = (pl.col(f"{side}_z") - cfg.z_floor) / (cfg.z_cap - cfg.z_floor)
+        df = df.with_columns(ramp.clip(0.0, 1.0).alias(f"{side}_score"))
+    return df
 
 
 def _check_columns(df: pl.DataFrame, required: tuple[str, ...], produced: tuple[str, ...]) -> None:

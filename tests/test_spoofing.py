@@ -8,6 +8,7 @@ from order_flow_imbalance_strategy.event_alignment import build_alignment_engine
 from order_flow_imbalance_strategy.ofi import compute_ofi
 from order_flow_imbalance_strategy.spoofing import (
     SpoofConfig,
+    side_scores,
     trailing_stats,
     unexplained_removal,
 )
@@ -76,6 +77,20 @@ def make_frame(rows: list[dict]) -> pl.DataFrame:
             }
         )
     return pl.DataFrame(out)
+
+
+def score_frame(
+    removal: list[float | None],
+    median: list[float | None],
+    std: list[float | None],
+) -> pl.DataFrame:
+    """side_scores input with identical bid and ask columns, so either side can be
+    asserted on."""
+    cols = {"removal": removal, "prior_median": median, "prior_std": std}
+    return pl.DataFrame(
+        {f"{side}_{k}": v for side in ("bid", "ask") for k, v in cols.items()},
+        schema_overrides={f"{side}_{k}": pl.Float64 for side in ("bid", "ask") for k in cols},
+    )
 
 
 def removal_frame(
@@ -405,3 +420,80 @@ def test_trailing_stats_preserve_source_columns():
 def test_spoof_config_is_frozen():
     with pytest.raises(FrozenInstanceError):
         SMALL.window_s = 10  # type: ignore[misc]
+
+
+# Scoring: z = (removal - prior_median) / (prior_std + eps), then a linear ramp
+# score = clip((z - z_floor) / (z_cap - z_floor), 0, 1)  -- 2 and 6 by default.
+
+
+def test_score_matches_hand_computed_values():
+    # z = 0 -> 0; z = (8 - 2) / 1 = 6 -> 1; z = (12 - 3) / 3.21455 = 2.7998 -> 0.19994
+    df = side_scores(
+        score_frame([2.0, 8.0, 12.0], [2.0, 2.0, 3.0], [2**0.5, 1.0, 3.214550]),
+        SpoofConfig(),
+    )
+    assert df["bid_score"].to_list() == pytest.approx([0.0, 1.0, 0.199942], abs=1e-6)
+    assert df["bid_z"][2] == pytest.approx(2.79977, abs=1e-5)
+
+
+def test_score_ramp_is_clipped_to_zero_and_one():
+    # median 0, std 1, so z == removal: below the floor, mid-ramp, past the cap.
+    df = side_scores(score_frame([1.0, 4.0, 50.0], [0.0] * 3, [1.0] * 3), SpoofConfig())
+    assert df["bid_score"].to_list() == pytest.approx([0.0, 0.5, 1.0])
+
+
+def test_no_variance_history_scores_any_excess_as_maximal():
+    # std 0: the +1e-8 keeps z finite. An unchanged removal is 0 suspicion; any
+    # excess at all is z ~ 5e7 -> score 1.
+    df = side_scores(score_frame([0.0, 0.5], [0.0, 0.0], [0.0, 0.0]), SpoofConfig())
+    assert df["bid_score"].to_list() == [0.0, 1.0]
+
+
+def test_unknown_removal_or_baseline_scores_null():
+    df = side_scores(
+        score_frame([None, 5.0, 5.0], [1.0, None, 1.0], [1.0, 1.0, None]), SpoofConfig()
+    )
+    assert df["bid_score"].null_count() == 3
+    assert df["bid_z"].null_count() == 3
+
+
+def test_thresholds_are_configurable():
+    # z = 2: on the default floor (score 0), but halfway up a 1..3 ramp.
+    frame = score_frame([2.0], [0.0], [1.0])
+    assert side_scores(frame, SpoofConfig())["bid_score"][0] == pytest.approx(0.0)
+    narrow = SpoofConfig(z_floor=1.0, z_cap=3.0)
+    assert side_scores(frame, narrow)["bid_score"][0] == pytest.approx(0.5)
+
+
+def test_side_scores_preserve_source_columns():
+    src = score_frame([1.0], [0.0], [1.0])
+    df = side_scores(src, SpoofConfig())
+    assert df.select(src.columns).equals(src)
+    assert df.columns == [*src.columns, "bid_z", "bid_score", "ask_z", "ask_score"]
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"window_s": 0},
+        {"min_obs": 1},  # a sample std needs two observations
+        {"z_floor": 6.0, "z_cap": 6.0},
+        {"z_floor": 6.0, "z_cap": 2.0},
+        {"eps": 0.0},
+    ],
+)
+def test_spoof_config_rejects_impossible_settings(kwargs):
+    with pytest.raises(ValueError):
+        SpoofConfig(**kwargs)
+
+
+def test_fingerprint_identifies_the_exact_settings():
+    # Same settings -> same id; any change (version included) -> a different one.
+    assert SpoofConfig().fingerprint() == SpoofConfig().fingerprint()
+    others = [
+        SpoofConfig(window_s=1800),
+        SpoofConfig(z_floor=2.5),
+        SpoofConfig(version="l1-depletion-v2"),
+    ]
+    ids = {c.fingerprint() for c in [SpoofConfig(), *others]}
+    assert len(ids) == 4
