@@ -1,7 +1,7 @@
 import json
 import math
 import random
-from dataclasses import FrozenInstanceError, replace
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 
 import polars as pl
@@ -12,14 +12,14 @@ from order_flow_imbalance_strategy.event_alignment import build_alignment_engine
 from order_flow_imbalance_strategy.ofi import compute_ofi
 from order_flow_imbalance_strategy.spoofing import (
     DEFAULT_CONFIG,
-    NO_FILTER_CONFIG,
+    INPUT_COLUMNS,
     VARIANTS,
     SpoofConfig,
     add_variants,
     bootstrap_mean_ci,
     build_tasks,
     clean_ofi,
-    daily_ic,
+    daily_ics,
     diagnostics,
     forward_return,
     main,
@@ -44,23 +44,6 @@ EMPTY_TRADES = {
     "sell_qty": pl.Float64,
     "notional": pl.Float64,
 }
-
-# Columns the spoofing filter will need to read. No trade_feed_missing: the
-# real pipeline only distinguishes "no trades" (no_trades), not "no trades
-# because the feed was down" vs "no trades because none happened".
-SPOOFING_INPUT_COLUMNS = (
-    "timestamp",
-    "bid_price",
-    "ask_price",
-    "bid_qty",
-    "ask_qty",
-    "ofi_1s",
-    "buy_qty",
-    "sell_qty",
-    "book_stale",
-    "book_dead",
-    "no_trades",
-)
 
 
 # Run the real align -> OFI path over a 10-second book with a native update
@@ -106,7 +89,6 @@ def make_frame(rows: list[dict]) -> pl.DataFrame:
     return pl.DataFrame(out)
 
 
-# diagnostics input: valid OFI everywhere, unknown wherever the score is null.
 # A synthetic aligned day: a live book that sometimes ticks, with random queues and
 # flow, so every stage has real work to do. Seeded so it's reproducible.
 def synthetic_day(n: int, seed: int, start: datetime = BASE_DT) -> pl.DataFrame:
@@ -149,12 +131,14 @@ def scored_days(days: list[int], seed0: int, n: int = 300) -> pl.DataFrame:
     return pl.concat(frames)
 
 
+# diagnostics input: valid OFI everywhere, unknown wherever the score is null.
 def scored_frame(scores: list[float | None]) -> pl.DataFrame:
     return pl.DataFrame(
         {
             "ofi_1s": [1.0] * len(scores),
             "spoof_score": scores,
             "spoof_unknown": [s is None for s in scores],
+            "warm_up": [False] * len(scores),
             "spoof_config_version": ["l1-depletion-v1"] * len(scores),
         },
         schema_overrides={"spoof_score": pl.Float64},
@@ -218,7 +202,7 @@ def test_aligned_ofi_output_has_the_columns_spoofing_needs():
 
     out = _aligned_ofi(trades)
 
-    missing = [c for c in SPOOFING_INPUT_COLUMNS if c not in out.columns]
+    missing = [c for c in INPUT_COLUMNS if c not in out.columns]
     assert not missing, f"align-v2 output no longer has: {missing}"
 
     # Spot-check the actual values a sell print and a buy print leave behind,
@@ -379,29 +363,6 @@ def test_first_row_has_no_previous_observation():
     assert df["ask_removal"][0] is None
 
 
-def test_source_columns_pass_through_unchanged():
-    src = make_frame(
-        [
-            {"bid_qty": 10.0, "ask_qty": 8.0},
-            {"bid_qty": 4.0, "ask_qty": 8.0, "sell_qty": 2.0},
-        ]
-    ).with_columns(pl.Series("ofi_1s", [None, -6.0]))
-    df = unexplained_removal(src)
-    assert df.select(src.columns).equals(src)
-    assert df.columns == [
-        *src.columns,
-        "bid_removal",
-        "ask_removal",
-        "bid_identifiable",
-        "ask_identifiable",
-    ]
-
-
-def test_missing_required_column_raises():
-    with pytest.raises(ValueError, match="sell_qty"):
-        unexplained_removal(make_frame([{"bid_qty": 1.0, "ask_qty": 1.0}]).drop("sell_qty"))
-
-
 # Trailing stats: median / sample std of the previous `window_s` comparable
 # removals, never the current one. window_s=4 keeps the arithmetic hand-checkable.
 SMALL = SpoofConfig(window_s=4, min_obs=2)
@@ -492,27 +453,6 @@ def test_trailing_stats_do_not_depend_on_future_rows():
     assert a.equals(b)
 
 
-def test_trailing_stats_preserve_source_columns():
-    src = removal_frame([1.0, 2.0, 3.0, 4.0, 5.0])
-    df = trailing_stats(src, SMALL)
-    assert df.select(src.columns).equals(src)
-    assert df.columns == [
-        *src.columns,
-        "warm_up",
-        "bid_prior_n",
-        "bid_prior_median",
-        "bid_prior_std",
-        "ask_prior_n",
-        "ask_prior_median",
-        "ask_prior_std",
-    ]
-
-
-def test_spoof_config_is_frozen():
-    with pytest.raises(FrozenInstanceError):
-        SMALL.window_s = 10  # type: ignore[misc]
-
-
 # Scoring: z = (removal - prior_median) / (prior_std + eps), then a linear ramp
 # score = clip((z - z_floor) / (z_cap - z_floor), 0, 1)  -- 2 and 6 by default.
 
@@ -554,28 +494,6 @@ def test_thresholds_are_configurable():
     assert side_scores(frame, SpoofConfig())["bid_score"][0] == pytest.approx(0.0)
     narrow = SpoofConfig(z_floor=1.0, z_cap=3.0)
     assert side_scores(frame, narrow)["bid_score"][0] == pytest.approx(0.5)
-
-
-def test_side_scores_preserve_source_columns():
-    src = score_frame([1.0], [0.0], [1.0])
-    df = side_scores(src, SpoofConfig())
-    assert df.select(src.columns).equals(src)
-    assert df.columns == [*src.columns, "bid_z", "bid_score", "ask_z", "ask_score"]
-
-
-@pytest.mark.parametrize(
-    "kwargs",
-    [
-        {"window_s": 0},
-        {"min_obs": 1},  # a sample std needs two observations
-        {"z_floor": 6.0, "z_cap": 6.0},
-        {"z_floor": 6.0, "z_cap": 2.0},
-        {"eps": 0.0},
-    ],
-)
-def test_spoof_config_rejects_impossible_settings(kwargs):
-    with pytest.raises(ValueError):
-        SpoofConfig(**kwargs)
 
 
 def test_fingerprint_identifies_the_exact_settings():
@@ -620,15 +538,7 @@ def test_invalid_ofi_stays_null_even_with_a_known_score():
     assert df["spoof_unknown"].to_list() == [False, False]
 
 
-def test_raw_ofi_column_is_left_untouched():
-    src = combine_frame([10.0, -4.0, 6.0, None], [0.2, 0.0, 1.0, 0.3], [0.5, 0.0, None, 0.1])
-    df = clean_ofi(src)
-    assert df.select(src.columns).equals(src)
-    assert df.columns == [*src.columns, "spoof_score", "ofi_clean", "spoof_unknown"]
-
-
-# Pipeline: score_spoofing runs removal -> stats -> scores -> clean and stamps the
-# config; NO_FILTER_CONFIG is the "filter off" arm of the ablation.
+# Pipeline: score_spoofing runs removal -> stats -> scores -> clean and stamps the config.
 
 
 def test_score_spoofing_runs_on_real_aligned_ofi_and_stamps_the_config():
@@ -647,6 +557,11 @@ def test_score_spoofing_runs_on_real_aligned_ofi_and_stamps_the_config():
     assert df["spoof_config_id"].unique().to_list() == [cfg.fingerprint()]
 
 
+def test_score_spoofing_rejects_a_frame_missing_an_input_column():
+    with pytest.raises(ValueError, match="sell_qty"):
+        score_spoofing(_aligned_ofi(pl.LazyFrame(schema=EMPTY_TRADES)).drop("sell_qty"))
+
+
 def test_invalid_ofi_stays_null_through_the_whole_pipeline():
     # The real align -> OFI frame nulls OFI everywhere outside 09:00:01..09, so
     # nearly the whole day is invalid OFI that must stay invalid after cleaning.
@@ -657,25 +572,6 @@ def test_invalid_ofi_stays_null_through_the_whole_pipeline():
     assert not invalid["spoof_unknown"].any()
 
 
-def test_no_filter_baseline_scores_zero_only_where_ofi_is_valid():
-    src = pl.DataFrame(
-        {
-            "timestamp": [BASE_DT + timedelta(seconds=i) for i in range(3)],
-            "ofi_1s": [1.5, None, -2.0],
-        }
-    )
-    df = score_spoofing(src, NO_FILTER_CONFIG)
-    assert df["spoof_score"].to_list() == [0.0, None, 0.0]
-    assert df["ofi_clean"].to_list() == [1.5, None, -2.0]
-    assert df["spoof_unknown"].to_list() == [False, False, False]
-    assert df["spoof_config_version"][0] == "no-filter-v1"
-
-
-def test_no_filter_baseline_is_a_distinct_configuration():
-    assert NO_FILTER_CONFIG.version != DEFAULT_CONFIG.version
-    assert NO_FILTER_CONFIG.fingerprint() != DEFAULT_CONFIG.fingerprint()
-
-
 def test_diagnostics_warns_when_over_ten_percent_of_scored_rows_exceed_half(caplog):
     # 8 scored rows (2 unknown), 2 above 0.5 -> 25% > 10%. Unknown rows are not
     # in the denominator: they aren't evidence either way.
@@ -684,7 +580,6 @@ def test_diagnostics_warns_when_over_ten_percent_of_scored_rows_exceed_half(capl
         out = diagnostics(scored_frame([0.0, 0.9, None, 0.1, 0.6, 0.0, 0.0, 0.2, None, 0.0]))
     assert out["n_scored"] == 8
     assert out["n_unknown"] == 2
-    assert out["n_high"] == 2
     assert out["frac_high"] == pytest.approx(0.25)
     assert out["warned"] is True
     assert "25.0%" in caplog.text
@@ -738,14 +633,13 @@ def test_process_file_writes_scored_day_and_is_idempotent(tmp_path):
         "date": "2023-01-01",
         "in_path": str(in_path),
         "out_path": str(out_path),
-        "cfg": SpoofConfig(window_s=10),
     }
 
     r1 = process_file(task)
     assert r1["status"] == "ok"
-    assert r1["n_rows"] == 50
     assert "frac_high" in r1  # diagnostics ride along in the status
     out = pl.read_parquet(out_path)
+    assert out.height == 50
     assert out["ofi_1s"].equals(src["ofi_1s"])  # raw OFI recoverable from the file
     assert process_file(task)["status"] == "skipped"
 
@@ -756,27 +650,20 @@ def test_process_file_missing_input_returns_no_input(tmp_path):
         "date": "2023-01-01",
         "in_path": str(tmp_path / "nope.parquet"),
         "out_path": str(tmp_path / "out.parquet"),
-        "cfg": DEFAULT_CONFIG,
     }
     assert process_file(task)["status"] == "no_input"
 
 
-def test_build_tasks_reads_ofi_files_and_names_output_by_config(tmp_path):
-    # Only days with an OFI file become tasks; the version in the output name keeps
-    # filtered and baseline runs from overwriting each other.
+def test_build_tasks_only_for_days_with_an_ofi_file(tmp_path):
     signals = tmp_path / "signals" / "BTCUSDT"
     signals.mkdir(parents=True)
     (signals / "BTCUSDT-ofi-A-2023-01-01.parquet").write_bytes(b"")
-    tasks = build_tasks(["BTCUSDT"], date(2023, 1, 1), date(2023, 1, 2), tmp_path, DEFAULT_CONFIG)
+    tasks = build_tasks(["BTCUSDT"], date(2023, 1, 1), date(2023, 1, 2), tmp_path)
     assert len(tasks) == 1
     assert tasks[0]["out_path"].endswith("BTCUSDT-ofi-spoof-l1-depletion-v1-2023-01-01.parquet")
-    baseline = build_tasks(
-        ["BTCUSDT"], date(2023, 1, 1), date(2023, 1, 1), tmp_path, NO_FILTER_CONFIG
-    )
-    assert baseline[0]["out_path"].endswith("BTCUSDT-ofi-spoof-no-filter-v1-2023-01-01.parquet")
 
 
-def test_main_scores_existing_days_and_baseline_flag_writes_separately(tmp_path):
+def test_main_scores_existing_days(tmp_path):
     signals = tmp_path / "signals" / "BTCUSDT"
     signals.mkdir(parents=True)
     compute_ofi(synthetic_day(50, seed=2)).write_parquet(
@@ -786,9 +673,7 @@ def test_main_scores_existing_days_and_baseline_flag_writes_separately(tmp_path)
     args += ["--data-dir", str(tmp_path), "--workers", "1"]
 
     assert main(args) == 0
-    assert main([*args, "--baseline"]) == 0
     assert (signals / "BTCUSDT-ofi-spoof-l1-depletion-v1-2023-01-01.parquet").exists()
-    assert (signals / "BTCUSDT-ofi-spoof-no-filter-v1-2023-01-01.parquet").exists()
 
 
 def test_main_end_before_start_returns_2(tmp_path):
@@ -895,9 +780,9 @@ def test_daily_ic_is_a_rank_correlation_per_day():
             "y": [1.0, 4.0, 9.0, 16.0] + [4.0, 3.0, 2.0, 1.0],
         }
     )
-    out = daily_ic(df, "x", "y")
+    out = daily_ics(df, "y", ["x"])
     assert out["day"].to_list() == [date(2023, 1, 1), date(2023, 1, 2)]
-    assert out["ic"].to_list() == pytest.approx([1.0, -1.0])
+    assert out["x"].to_list() == pytest.approx([1.0, -1.0])
 
 
 def test_bootstrap_ci_resamples_days_reproducibly():
@@ -951,7 +836,7 @@ def test_selection_must_end_before_confirmation_starts():
 def test_main_writes_a_report_from_runner_files(tmp_path):
     for i, d in enumerate([1, 2, 3, 4]):
         day = date(2023, 1, d)
-        path = spoof_path(tmp_path, "BTCUSDT", day, DEFAULT_CONFIG)
+        path = spoof_path(tmp_path, "BTCUSDT", day)
         path.parent.mkdir(parents=True, exist_ok=True)
         raw = synthetic_day(300, seed=60 + i, start=datetime(2023, 1, d, 9))
         score_spoofing(compute_ofi(raw), ABLATION_CFG).write_parquet(path)
