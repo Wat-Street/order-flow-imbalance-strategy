@@ -1,3 +1,4 @@
+from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta
 
 import polars as pl
@@ -5,7 +6,11 @@ import pytest
 
 from order_flow_imbalance_strategy.event_alignment import build_alignment_engine
 from order_flow_imbalance_strategy.ofi import compute_ofi
-from order_flow_imbalance_strategy.spoofing import unexplained_removal
+from order_flow_imbalance_strategy.spoofing import (
+    SpoofConfig,
+    trailing_stats,
+    unexplained_removal,
+)
 
 T0 = int(datetime(2023, 1, 1, 9, 0, 0, tzinfo=UTC).timestamp() * 1000)
 DAY = datetime(2023, 1, 1).date()
@@ -71,6 +76,26 @@ def make_frame(rows: list[dict]) -> pl.DataFrame:
             }
         )
     return pl.DataFrame(out)
+
+
+def removal_frame(
+    bid: list[float | None],
+    ask: list[float | None] | None = None,
+    secs: list[int] | None = None,
+    book_dead: list[bool] | None = None,
+) -> pl.DataFrame:
+    """Minimal trailing_stats input: removals per second from BASE_DT. ``ask``
+    defaults to a copy of ``bid``; ``secs`` lets a test punch gaps in the grid."""
+    n = len(bid)
+    return pl.DataFrame(
+        {
+            "timestamp": [BASE_DT + timedelta(seconds=s) for s in (secs or range(n))],
+            "book_dead": book_dead or [False] * n,
+            "bid_removal": bid,
+            "ask_removal": ask if ask is not None else list(bid),
+        },
+        schema_overrides={"bid_removal": pl.Float64, "ask_removal": pl.Float64},
+    )
 
 
 def test_aligned_ofi_output_has_the_columns_spoofing_needs():
@@ -269,3 +294,114 @@ def test_source_columns_pass_through_unchanged():
 def test_missing_required_column_raises():
     with pytest.raises(ValueError, match="sell_qty"):
         unexplained_removal(make_frame([{"bid_qty": 1.0, "ask_qty": 1.0}]).drop("sell_qty"))
+
+
+# Trailing stats: median / sample std of the previous ``window_s`` comparable
+# removals, never the current one. window_s=4 keeps the arithmetic hand-checkable.
+SMALL = SpoofConfig(window_s=4, min_obs=2)
+
+
+def test_prior_stats_exclude_the_current_interval():
+    # Row 6's window is rows 2..5 = [3, null, 2, 8] -> [3, 2, 8]: median 3,
+    # mean 13/3, squared deviations sum to 20.667, / (3 - 1) -> std sqrt(10.333).
+    # The 12.0 at row 6 itself must not appear anywhere in its own stats.
+    df = trailing_stats(removal_frame([None, 1.0, 3.0, None, 2.0, 8.0, 12.0]), SMALL)
+    assert df["bid_prior_n"][6] == 3
+    assert df["bid_prior_median"][6] == pytest.approx(3.0)
+    assert df["bid_prior_std"][6] == pytest.approx(3.214550, abs=1e-6)
+    # Row 4: window [null, 1, 3, null] -> median 2, std sqrt(2)
+    assert df["bid_prior_median"][4] == pytest.approx(2.0)
+    assert df["bid_prior_std"][4] == pytest.approx(2**0.5)
+
+
+def test_insufficient_history_until_the_window_is_full():
+    # Rows 0..3 have fewer than window_s prior seconds in the segment.
+    df = trailing_stats(removal_frame([None, 1.0, 3.0, None, 2.0, 8.0, 12.0]), SMALL)
+    assert df["warm_up"].to_list() == [True] * 4 + [False] * 3
+    assert df["bid_prior_median"][:4].null_count() == 4
+    assert df["bid_prior_std"][:4].null_count() == 4
+
+
+def test_fewer_than_min_obs_comparable_removals_is_null():
+    # Warm, but the window [null, null, null, 5] holds only one comparable value,
+    # and a sample std needs two.
+    df = trailing_stats(removal_frame([None, None, None, 5.0, 1.0]), SMALL)
+    assert df["warm_up"][4] is False
+    assert df["bid_prior_n"][4] == 1
+    assert df["bid_prior_median"][4] is None
+    assert df["bid_prior_std"][4] is None
+
+
+def test_sides_use_their_own_history():
+    df = trailing_stats(
+        removal_frame([0.0, 0.0, 0.0, 0.0, 9.0], ask=[1.0, 2.0, 3.0, 4.0, 0.0]), SMALL
+    )
+    assert df["bid_prior_median"][4] == pytest.approx(0.0)
+    assert df["ask_prior_median"][4] == pytest.approx(2.5)
+
+
+def test_no_variance_history_gives_zero_std():
+    # A flat history is a real (if awkward) case: std is 0.0, not null. Scoring
+    # handles it via the +1e-8 in the z denominator.
+    df = trailing_stats(removal_frame([0.0, 0.0, 0.0, 0.0, 0.5]), SMALL)
+    assert df["bid_prior_median"][4] == 0.0
+    assert df["bid_prior_std"][4] == 0.0
+
+
+def test_gap_in_grid_resets_the_warm_up():
+    # 09:00:00..04, then a missing second, then 09:00:06..10. The second stretch
+    # has to re-warm from scratch: its history must not bridge the hole.
+    secs = [0, 1, 2, 3, 4, 6, 7, 8, 9, 10]
+    df = trailing_stats(removal_frame([1.0] * 10, secs=secs), SMALL)
+    assert df["warm_up"].to_list() == [True] * 4 + [False] + [True] * 4 + [False]
+    assert df["bid_prior_n"][5] == 0  # first row after the gap sees no history
+
+
+def test_daily_boundary_resets_the_warm_up():
+    # 23:59:58 -> 00:00:00 is a 1-second step on the grid but a new trading day.
+    start = datetime(2023, 1, 1, 23, 59, 55)
+    base_offset = int((start - BASE_DT).total_seconds())
+    df = trailing_stats(removal_frame([1.0] * 10, secs=[base_offset + i for i in range(10)]), SMALL)
+    # 23:59:55..59 is one segment (5 rows), 00:00:00..04 starts another.
+    assert df["warm_up"].to_list() == [True] * 4 + [False] + [True] * 4 + [False]
+
+
+def test_dead_book_resets_the_warm_up():
+    # A dead feed is a gap in the book even though the grid row exists.
+    dead = [False] * 5 + [True] + [False] * 5
+    df = trailing_stats(removal_frame([1.0] * 11, book_dead=dead), SMALL)
+    assert df["warm_up"][4] is False
+    assert df["warm_up"][5] is True
+    assert df["warm_up"][6:10].to_list() == [True] * 4
+    assert df["warm_up"][10] is False
+
+
+def test_trailing_stats_do_not_depend_on_future_rows():
+    # Changing everything after the cut must leave every stat up to the cut as is.
+    base = [float(i % 7) for i in range(40)]
+    cut = 25
+    future_changed = base[: cut + 1] + [100.0 * v for v in base[cut + 1 :]]
+    a = trailing_stats(removal_frame(base), SMALL).head(cut + 1)
+    b = trailing_stats(removal_frame(future_changed), SMALL).head(cut + 1)
+    assert a.equals(b)
+
+
+def test_trailing_stats_preserve_source_columns():
+    src = removal_frame([1.0, 2.0, 3.0, 4.0, 5.0])
+    df = trailing_stats(src, SMALL)
+    assert df.select(src.columns).equals(src)
+    assert df.columns == [
+        *src.columns,
+        "warm_up",
+        "bid_prior_n",
+        "bid_prior_median",
+        "bid_prior_std",
+        "ask_prior_n",
+        "ask_prior_median",
+        "ask_prior_std",
+    ]
+
+
+def test_spoof_config_is_frozen():
+    with pytest.raises(FrozenInstanceError):
+        SMALL.window_s = 10  # type: ignore[misc]
