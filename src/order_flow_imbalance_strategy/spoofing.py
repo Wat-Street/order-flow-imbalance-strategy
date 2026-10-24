@@ -1,7 +1,11 @@
 # L1 cancellation-suspicion filter: down-weights OFI by unexplained queue removal.
 # note: aligned flow is zero-filled, so a missing trade feed reads as "no trades"
-# run: python -m order_flow_imbalance_strategy.spoofing --symbols BTCUSDT
+# note: the ablation's "trade_excluded" variant is our reading of the spec
+# run: python -m order_flow_imbalance_strategy.spoofing score --symbols BTCUSDT
 #          --start 2024-01-01 --end 2024-01-31 [--baseline]
+#      python -m order_flow_imbalance_strategy.spoofing ablate --symbol BTCUSDT
+#          --select-start 2024-01-01 --select-end 2024-02-29
+#          --confirm-start 2024-03-01 --confirm-end 2024-03-31
 
 from __future__ import annotations
 
@@ -12,11 +16,12 @@ import logging
 import sys
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import date
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import polars as pl
 from tqdm import tqdm
 
@@ -74,6 +79,16 @@ CONFIG_STAMP_COLUMNS: tuple[str, ...] = ("spoof_config_version", "spoof_config_i
 # warn when more than 10% of scored rows score above 0.5
 WARN_SCORE = 0.5
 WARN_FRACTION = 0.10
+
+# thresholds are picked at one predeclared horizon; the rest are reported alongside
+SELECTION_HORIZON_S = 30
+REPORT_HORIZONS_S = (10, 30, 60)
+THRESHOLD_GRID = tuple((f, c) for f in (1.5, 2.0, 3.0) for c in (4.0, 6.0, 8.0))
+
+EXCLUDE_ABOVE = 0.5
+VARIANTS = ("raw", "diagnostic", "down_weighted", "trade_excluded")
+N_BOOT = 10_000
+BOOT_SEED = 7
 
 
 # scoring settings, frozen so they can't change mid-evaluation
@@ -353,24 +368,167 @@ def process_file(task: dict[str, Any]) -> dict[str, Any]:
         return status
 
 
+# log mid change h seconds ahead, only between two valid quotes on the same UTC day
+def forward_return(df: pl.DataFrame, horizon_s: int) -> pl.DataFrame:
+    t = pl.col("timestamp")
+    mid = (pl.col("bid_price") + pl.col("ask_price")) / 2
+    quote_ok = (
+        ~pl.col("book_stale") & ~pl.col("book_dead") & (pl.col("ask_price") > pl.col("bid_price"))
+    ).fill_null(False)
+    ok = (
+        quote_ok
+        & quote_ok.shift(-horizon_s).fill_null(False)
+        & (t.shift(-horizon_s) - t == pl.duration(seconds=horizon_s)).fill_null(False)
+        & (t.shift(-horizon_s).dt.date() == t.dt.date()).fill_null(False)
+    )
+    ret = (mid.shift(-horizon_s) / mid).log()
+    return df.sort("timestamp").with_columns(pl.when(ok).then(ret).alias(f"fwd_ret_{horizon_s}s"))
+
+
+# rerun the production scoring with other thresholds on an already-scored frame
+def rescore(df: pl.DataFrame, cfg: SpoofConfig) -> pl.DataFrame:
+    stale = [*SCORE_OUTPUT_COLUMNS, *CLEAN_OUTPUT_COLUMNS, *CONFIG_STAMP_COLUMNS]
+    return clean_ofi(side_scores(df.drop(stale, strict=False), cfg))
+
+
+def add_variants(df: pl.DataFrame) -> pl.DataFrame:
+    return df.with_columns(
+        pl.col("ofi_1s").alias("feat_raw"),
+        pl.col("ofi_clean").alias("feat_down_weighted"),
+        pl.when(pl.col("spoof_score") > EXCLUDE_ABOVE)
+        .then(0.0)
+        .otherwise(pl.col("ofi_1s"))
+        .alias("feat_trade_excluded"),
+    )
+
+
+# Spearman correlation of feature with target, one row per UTC day
+def daily_ic(df: pl.DataFrame, feature: str, target: str) -> pl.DataFrame:
+    return (
+        df.group_by(pl.col("timestamp").dt.date().alias("day"))
+        .agg(pl.corr(feature, target, method="spearman").alias("ic"))
+        .sort("day")
+    )
+
+
+# mean and 95% CI by resampling days with replacement (days are the independent blocks)
+def bootstrap_mean_ci(
+    values: list[float], n_boot: int = N_BOOT, seed: int = BOOT_SEED
+) -> tuple[float, float, float]:
+    arr = np.asarray(values, dtype=float)
+    if arr.size == 0:
+        raise ValueError("no days to bootstrap")
+    rng = np.random.default_rng(seed)
+    boots = rng.choice(arr, size=(n_boot, arr.size), replace=True).mean(axis=1)
+    lo, hi = np.percentile(boots, [2.5, 97.5])
+    return float(arr.mean()), float(lo), float(hi)
+
+
+def run_ablation(
+    selection: pl.DataFrame,
+    confirmation: pl.DataFrame,
+    selection_horizon_s: int = SELECTION_HORIZON_S,
+    report_horizons_s: tuple[int, ...] = REPORT_HORIZONS_S,
+) -> dict[str, Any]:
+    sel_days = _days(selection)
+    conf_days = _days(confirmation)
+    if sel_days[-1] >= conf_days[0]:
+        raise ValueError("selection days must all end before confirmation starts")
+
+    # --- selection: everything here sees selection days only ---
+    target = f"fwd_ret_{selection_horizon_s}s"
+    labeled = forward_return(selection, selection_horizon_s)
+    grid = []
+    for z_floor, z_cap in THRESHOLD_GRID:
+        cfg = replace(DEFAULT_CONFIG, z_floor=z_floor, z_cap=z_cap)
+        rows = _cohort(add_variants(rescore(labeled, cfg)), target)
+        ics = _daily_ics(rows, target, ["feat_raw", "feat_down_weighted"])
+        diffs = ics["feat_down_weighted"] - ics["feat_raw"]
+        grid.append(
+            {
+                "z_floor": z_floor,
+                "z_cap": z_cap,
+                "mean_diff": float(diffs.mean()) if ics.height else None,
+            }
+        )
+    usable = [g for g in grid if g["mean_diff"] is not None]
+    if not usable:
+        raise ValueError("no labeled, scored rows in the selection period")
+    best = max(usable, key=lambda g: g["mean_diff"])
+    locked = replace(
+        DEFAULT_CONFIG,
+        version=f"{DEFAULT_CONFIG.version}-sel-f{best['z_floor']}-c{best['z_cap']}",
+        z_floor=best["z_floor"],
+        z_cap=best["z_cap"],
+    )
+    coefs = _fit_diagnostic(_cohort(add_variants(rescore(labeled, locked)), target), target)
+
+    # --- confirmation: the locked config and coefficients, applied once ---
+    scored = add_variants(rescore(confirmation, locked))
+    ofi_valid = scored["ofi_1s"].is_not_null()
+    by_horizon = {}
+    for h in report_horizons_s:
+        h_target = f"fwd_ret_{h}s"
+        rows = _with_diagnostic(_cohort(forward_return(scored, h), h_target), coefs)
+        by_horizon[str(h)] = _evaluate(rows, h_target)
+
+    return {
+        "horizon_s": selection_horizon_s,
+        "selection": {
+            "days": [d.isoformat() for d in sel_days],
+            "configs_tried": len(grid),
+            "grid": grid,
+            "locked_config": asdict(locked),
+            "locked_id": locked.fingerprint(),
+            "diagnostic_coefs": coefs,
+        },
+        "confirmation": {
+            "days": [d.isoformat() for d in conf_days],
+            "scored_share_of_valid_ofi": float(
+                scored.filter(ofi_valid)["spoof_score"].is_not_null().mean() or 0.0
+            ),
+            "by_horizon": by_horizon,
+        },
+        "notes": [
+            "trade_excluded zeroes OFI where spoof_score > 0.5; our reading of the spec",
+            "diagnostic = OLS on [1, ofi, score, ofi*score] fit on the selection cohort",
+            "cohort: valid OFI, known spoof_score and a valid forward return",
+            "CI: bootstrap over days of paired per-day IC differences",
+        ],
+    }
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Score OFI days for L1 cancellation suspicion")
-    parser.add_argument("--symbols", nargs="+", required=True, help="e.g. BTCUSDT ETHUSDT")
-    parser.add_argument("--start", type=parse_date, required=True, help="start date YYYY-MM-DD")
-    parser.add_argument("--end", type=parse_date, required=True, help="end date YYYY-MM-DD")
-    parser.add_argument("--workers", type=int, default=4, help="process pool size (default 4)")
-    parser.add_argument(
-        "--data-dir", type=Path, default=Path("data"), help="root data dir (default ./data)"
-    )
-    parser.add_argument(
-        "--baseline", action="store_true", help="write the no-filter baseline instead"
-    )
+    parser = argparse.ArgumentParser(description="L1 cancellation-suspicion filter for OFI")
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    score = commands.add_parser("score", help="score OFI days and write them")
+    score.add_argument("--symbols", nargs="+", required=True, help="e.g. BTCUSDT ETHUSDT")
+    score.add_argument("--start", type=parse_date, required=True, help="start date YYYY-MM-DD")
+    score.add_argument("--end", type=parse_date, required=True, help="end date YYYY-MM-DD")
+    score.add_argument("--workers", type=int, default=4, help="process pool size (default 4)")
+    score.add_argument("--baseline", action="store_true", help="write the no-filter baseline")
+
+    ablate = commands.add_parser("ablate", help="compare raw and cleaned OFI on later days")
+    ablate.add_argument("--symbol", required=True, help="e.g. BTCUSDT")
+    ablate.add_argument("--select-start", type=parse_date, required=True)
+    ablate.add_argument("--select-end", type=parse_date, required=True)
+    ablate.add_argument("--confirm-start", type=parse_date, required=True)
+    ablate.add_argument("--confirm-end", type=parse_date, required=True)
+
+    for sub in (score, ablate):
+        sub.add_argument(
+            "--data-dir", type=Path, default=Path("data"), help="root data dir (default ./data)"
+        )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    return _ablate(args) if args.command == "ablate" else _score_days(args)
 
+
+def _score_days(args: argparse.Namespace) -> int:
     if args.end < args.start:
         print(f"error: --end {args.end} is before --start {args.start}", file=sys.stderr)
         return 2
@@ -414,6 +572,97 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     return 0
+
+
+def _ablate(args: argparse.Namespace) -> int:
+    if not (args.select_start <= args.select_end < args.confirm_start <= args.confirm_end):
+        print(
+            "error: need select-start <= select-end < confirm-start <= confirm-end", file=sys.stderr
+        )
+        return 2
+
+    selection = _load_days(args.data_dir, args.symbol, args.select_start, args.select_end)
+    confirmation = _load_days(args.data_dir, args.symbol, args.confirm_start, args.confirm_end)
+    if selection is None or confirmation is None:
+        print("error: no scored spoofing files for one of the periods", file=sys.stderr)
+        return 1
+
+    report = {"symbol": args.symbol, **run_ablation(selection, confirmation)}
+    out = args.data_dir / "reports"
+    out = out / f"spoofing-ablation-{args.symbol}-{args.confirm_start}-{args.confirm_end}.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(report, indent=2))
+
+    sel = report["selection"]
+    print(f"locked {sel['locked_config']['version']} (id {sel['locked_id']})")
+    for h, res in report["confirmation"]["by_horizon"].items():
+        print(f"\n{h}s horizon: {res['n_rows']} rows over {res['n_days']} day(s)")
+        for name, v in res["variants"].items():
+            lo, hi = v["ci95"]
+            diff = v["diff_vs_raw"]
+            print(
+                f"  {name:>15}: IC {v['mean_ic']:+.4f}  vs raw {diff:+.4f} [{lo:+.4f}, {hi:+.4f}]"
+            )
+    print(f"\nreport: {out}")
+    return 0
+
+
+def _days(df: pl.DataFrame) -> list[date]:
+    return df["timestamp"].dt.date().unique().sort().to_list()
+
+
+# rows where every variant and the label are defined
+def _cohort(df: pl.DataFrame, target: str) -> pl.DataFrame:
+    return df.filter(
+        pl.col("ofi_1s").is_not_null()
+        & pl.col("spoof_score").is_not_null()
+        & pl.col(target).is_not_null()
+    )
+
+
+# per-day IC of each feature, keeping only days where every IC is defined
+def _daily_ics(df: pl.DataFrame, target: str, features: list[str]) -> pl.DataFrame:
+    ics = daily_ic(df, features[0], target).rename({"ic": features[0]})
+    for f in features[1:]:
+        ics = ics.join(daily_ic(df, f, target).rename({"ic": f}), on="day")
+    return ics.fill_nan(None).drop_nulls()
+
+
+def _fit_diagnostic(df: pl.DataFrame, target: str) -> list[float]:
+    ofi = df["ofi_1s"].to_numpy()
+    score = df["spoof_score"].to_numpy()
+    x = np.column_stack([np.ones_like(ofi), ofi, score, ofi * score])
+    coefs, *_ = np.linalg.lstsq(x, df[target].to_numpy(), rcond=None)
+    return [float(c) for c in coefs]
+
+
+def _with_diagnostic(df: pl.DataFrame, coefs: list[float]) -> pl.DataFrame:
+    b0, b1, b2, b3 = coefs
+    ofi, score = pl.col("ofi_1s"), pl.col("spoof_score")
+    return df.with_columns((b0 + b1 * ofi + b2 * score + b3 * ofi * score).alias("feat_diagnostic"))
+
+
+def _evaluate(df: pl.DataFrame, target: str) -> dict[str, Any]:
+    ics = _daily_ics(df, target, [f"feat_{v}" for v in VARIANTS])
+    variants = {}
+    for v in VARIANTS:
+        ic = ics[f"feat_{v}"]
+        if v == "raw" or ics.height == 0:
+            diff, lo, hi = (0.0, 0.0, 0.0) if v == "raw" else (None, None, None)
+        else:
+            diff, lo, hi = bootstrap_mean_ci((ic - ics["feat_raw"]).to_list())
+        variants[v] = {
+            "mean_ic": float(ic.mean()) if ics.height else None,
+            "diff_vs_raw": diff,
+            "ci95": [lo, hi],
+        }
+    return {"n_rows": df.height, "n_days": ics.height, "variants": variants}
+
+
+def _load_days(data_dir: Path, symbol: str, start: date, end: date) -> pl.DataFrame | None:
+    paths = [spoof_path(data_dir, symbol, d, DEFAULT_CONFIG) for d in daterange(start, end)]
+    frames = [pl.read_parquet(p) for p in paths if p.exists()]
+    return pl.concat(frames, how="diagonal_relaxed") if frames else None
 
 
 if __name__ == "__main__":

@@ -1,5 +1,7 @@
+import json
+import math
 import random
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from datetime import UTC, date, datetime, timedelta
 
 import polars as pl
@@ -11,14 +13,22 @@ from order_flow_imbalance_strategy.ofi import compute_ofi
 from order_flow_imbalance_strategy.spoofing import (
     DEFAULT_CONFIG,
     NO_FILTER_CONFIG,
+    VARIANTS,
     SpoofConfig,
+    add_variants,
+    bootstrap_mean_ci,
     build_tasks,
     clean_ofi,
+    daily_ic,
     diagnostics,
+    forward_return,
     main,
     process_file,
+    rescore,
+    run_ablation,
     score_spoofing,
     side_scores,
+    spoof_path,
     trailing_stats,
     unexplained_removal,
 )
@@ -27,6 +37,7 @@ T0 = int(datetime(2023, 1, 1, 9, 0, 0, tzinfo=UTC).timestamp() * 1000)
 DAY = datetime(2023, 1, 1).date()
 BASE_DT = datetime(2023, 1, 1, 9, 0, 0)
 _TS = pl.col("timestamp").cast(pl.Datetime("ms"))
+ABLATION_CFG = SpoofConfig(window_s=30)
 EMPTY_TRADES = {
     "timestamp": pl.Datetime("ms"),
     "buy_qty": pl.Float64,
@@ -98,11 +109,11 @@ def make_frame(rows: list[dict]) -> pl.DataFrame:
 # diagnostics input: valid OFI everywhere, unknown wherever the score is null.
 # A synthetic aligned day: a live book that sometimes ticks, with random queues and
 # flow, so every stage has real work to do. Seeded so it's reproducible.
-def synthetic_day(n: int, seed: int) -> pl.DataFrame:
+def synthetic_day(n: int, seed: int, start: datetime = BASE_DT) -> pl.DataFrame:
     rng = random.Random(seed)
     return pl.DataFrame(
         {
-            "timestamp": [BASE_DT + timedelta(seconds=i) for i in range(n)],
+            "timestamp": [start + timedelta(seconds=i) for i in range(n)],
             "bid_price": [100.0 + 0.1 * rng.randint(0, 1) for _ in range(n)],
             "ask_price": [100.5 + 0.1 * rng.randint(0, 1) for _ in range(n)],
             "bid_qty": [rng.expovariate(1 / 5) for _ in range(n)],
@@ -113,6 +124,29 @@ def synthetic_day(n: int, seed: int) -> pl.DataFrame:
             "book_dead": [False] * n,
         }
     )
+
+
+# A quote frame from bid prices (ask = bid + 0.5) at the given seconds.
+def quotes(bids: list[float], secs: list[int] | None = None, start: datetime = BASE_DT, **flags):
+    n = len(bids)
+    return pl.DataFrame(
+        {
+            "timestamp": [start + timedelta(seconds=s) for s in (secs or range(n))],
+            "bid_price": bids,
+            "ask_price": flags.get("asks", [b + 0.5 for b in bids]),
+            "book_stale": flags.get("book_stale", [False] * n),
+            "book_dead": flags.get("book_dead", [False] * n),
+        }
+    )
+
+
+# Scored days as the runner would write them, one per calendar day.
+def scored_days(days: list[int], seed0: int, n: int = 300) -> pl.DataFrame:
+    frames = []
+    for i, d in enumerate(days):
+        raw = synthetic_day(n, seed=seed0 + i, start=datetime(2023, 1, d, 9))
+        frames.append(score_spoofing(compute_ofi(raw), ABLATION_CFG))
+    return pl.concat(frames)
 
 
 def scored_frame(scores: list[float | None]) -> pl.DataFrame:
@@ -748,7 +782,7 @@ def test_main_scores_existing_days_and_baseline_flag_writes_separately(tmp_path)
     compute_ofi(synthetic_day(50, seed=2)).write_parquet(
         signals / "BTCUSDT-ofi-A-2023-01-01.parquet"
     )
-    args = ["--symbols", "BTCUSDT", "--start", "2023-01-01", "--end", "2023-01-01"]
+    args = ["score", "--symbols", "BTCUSDT", "--start", "2023-01-01", "--end", "2023-01-01"]
     args += ["--data-dir", str(tmp_path), "--workers", "1"]
 
     assert main(args) == 0
@@ -760,6 +794,7 @@ def test_main_scores_existing_days_and_baseline_flag_writes_separately(tmp_path)
 def test_main_end_before_start_returns_2(tmp_path):
     rc = main(
         [
+            "score",
             "--symbols",
             "BTCUSDT",
             "--start",
@@ -776,6 +811,7 @@ def test_main_end_before_start_returns_2(tmp_path):
 def test_main_no_inputs_returns_0(tmp_path):
     rc = main(
         [
+            "score",
             "--symbols",
             "BTCUSDT",
             "--start",
@@ -787,3 +823,152 @@ def test_main_no_inputs_returns_0(tmp_path):
         ]
     )
     assert rc == 0
+
+
+# Forward midpoint return: log(mid[t+h] / mid[t]), only between two valid quotes
+# exactly h seconds apart on the same UTC day.
+
+
+def test_forward_return_is_the_log_mid_change_h_seconds_ahead():
+    # mids 100.25, 100.25, 101.25, 101.25, 102.25 with h = 2
+    df = forward_return(quotes([100.0, 100.0, 101.0, 101.0, 102.0]), 2)
+    up = math.log(101.25 / 100.25)
+    assert df["fwd_ret_2s"].to_list()[:3] == pytest.approx([up, up, math.log(102.25 / 101.25)])
+    assert df["fwd_ret_2s"][3:].null_count() == 2  # no t+2 inside the frame
+
+
+def test_flat_moves_are_kept_as_zero_returns():
+    df = forward_return(quotes([100.0, 100.0]), 1)
+    assert df["fwd_ret_1s"][0] == 0.0
+
+
+@pytest.mark.parametrize("flag", ["book_stale", "book_dead"])
+def test_stale_or_dead_endpoint_has_no_label(flag):
+    df = forward_return(quotes([100.0, 101.0, 102.0], **{flag: [False, True, False]}), 1)
+    assert df["fwd_ret_1s"][0] is None  # ends on the bad quote
+    assert df["fwd_ret_1s"][1] is None  # starts on it
+
+
+def test_crossed_endpoint_has_no_label():
+    df = forward_return(quotes([100.0, 101.0], asks=[100.5, 100.5]), 1)
+    assert df["fwd_ret_1s"][0] is None
+
+
+def test_gap_or_day_boundary_has_no_label():
+    gap = forward_return(quotes([100.0, 101.0, 102.0], secs=[0, 1, 3]), 1)
+    assert gap["fwd_ret_1s"][1] is None
+    midnight = forward_return(quotes([100.0, 101.0], start=datetime(2023, 1, 1, 23, 59, 59)), 1)
+    assert midnight["fwd_ret_1s"][0] is None
+
+
+def test_rescore_with_the_original_thresholds_reproduces_the_scores():
+    scored = score_spoofing(compute_ofi(synthetic_day(300, seed=0)), ABLATION_CFG)
+    again = rescore(scored, ABLATION_CFG)
+    assert again["spoof_score"].equals(scored["spoof_score"])
+    narrow = rescore(scored, replace(ABLATION_CFG, z_floor=0.5, z_cap=1.0))
+    assert not narrow["spoof_score"].equals(scored["spoof_score"])
+
+
+def test_variants_share_raw_ofi_and_differ_only_in_cleaning():
+    df = add_variants(
+        pl.DataFrame(
+            {
+                "ofi_1s": [10.0, 10.0, 10.0],
+                "spoof_score": [0.6, 0.5, 0.0],
+                "ofi_clean": [4.0, 5.0, 10.0],
+            }
+        )
+    )
+    assert df["feat_raw"].to_list() == [10.0, 10.0, 10.0]
+    assert df["feat_down_weighted"].to_list() == [4.0, 5.0, 10.0]
+    # trade-excluded zeroes OFI strictly above 0.5 and keeps the row in the cohort
+    assert df["feat_trade_excluded"].to_list() == [0.0, 10.0, 10.0]
+
+
+def test_daily_ic_is_a_rank_correlation_per_day():
+    day1 = [BASE_DT + timedelta(seconds=i) for i in range(4)]
+    day2 = [datetime(2023, 1, 2, 9) + timedelta(seconds=i) for i in range(4)]
+    df = pl.DataFrame(
+        {
+            "timestamp": day1 + day2,
+            "x": [1.0, 2.0, 3.0, 4.0] * 2,
+            "y": [1.0, 4.0, 9.0, 16.0] + [4.0, 3.0, 2.0, 1.0],
+        }
+    )
+    out = daily_ic(df, "x", "y")
+    assert out["day"].to_list() == [date(2023, 1, 1), date(2023, 1, 2)]
+    assert out["ic"].to_list() == pytest.approx([1.0, -1.0])
+
+
+def test_bootstrap_ci_resamples_days_reproducibly():
+    diffs = [0.012, -0.004, 0.020, 0.001, 0.015, -0.008, 0.009, 0.011]
+    mean, lo, hi = bootstrap_mean_ci(diffs, n_boot=10_000, seed=7)
+    assert mean == pytest.approx(0.007)
+    assert (lo, hi) == pytest.approx((0.0005, 0.01312), abs=1e-5)
+
+
+# The ablation: thresholds picked on selection days only, then the locked config
+# is evaluated once on later confirmation days, every variant on one cohort.
+
+
+def test_ablation_locks_a_grid_config_using_selection_days_only():
+    selection = scored_days([1, 2, 3], seed0=10)
+    confirmation = scored_days([4, 5], seed0=20)
+    report = run_ablation(selection, confirmation)
+
+    grid = report["selection"]["grid"]
+    assert report["selection"]["configs_tried"] == len(grid) == 9
+    locked = report["selection"]["locked_config"]
+    best = max(grid, key=lambda g: g["mean_diff"])
+    assert (locked["z_floor"], locked["z_cap"]) == (best["z_floor"], best["z_cap"])
+    assert report["selection"]["locked_id"] != DEFAULT_CONFIG.fingerprint()
+
+    # wrecking the confirmation days can't move anything chosen on selection days
+    wrecked = confirmation.with_columns(pl.col("bid_price") * 3, pl.col("ask_price") * 3)
+    again = run_ablation(selection, wrecked)
+    assert again["selection"] == report["selection"]
+
+
+def test_every_variant_is_scored_on_the_same_cohort():
+    selection = scored_days([1, 2], seed0=30)
+    confirmation = scored_days([3, 4], seed0=40)
+    report = run_ablation(selection, confirmation)
+
+    for horizon in report["confirmation"]["by_horizon"].values():
+        assert set(horizon["variants"]) == set(VARIANTS)
+        assert horizon["n_rows"] > 0
+        raw = horizon["variants"]["raw"]
+        assert raw["diff_vs_raw"] == 0.0
+        assert raw["ci95"] == [0.0, 0.0]
+
+
+def test_selection_must_end_before_confirmation_starts():
+    early = scored_days([1, 2], seed0=50)
+    with pytest.raises(ValueError, match="before confirmation"):
+        run_ablation(early, early)
+
+
+def test_main_writes_a_report_from_runner_files(tmp_path):
+    for i, d in enumerate([1, 2, 3, 4]):
+        day = date(2023, 1, d)
+        path = spoof_path(tmp_path, "BTCUSDT", day, DEFAULT_CONFIG)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        raw = synthetic_day(300, seed=60 + i, start=datetime(2023, 1, d, 9))
+        score_spoofing(compute_ofi(raw), ABLATION_CFG).write_parquet(path)
+
+    args = ["ablate", "--symbol", "BTCUSDT", "--data-dir", str(tmp_path)]
+    args += ["--select-start", "2023-01-01", "--select-end", "2023-01-02"]
+    args += ["--confirm-start", "2023-01-03", "--confirm-end", "2023-01-04"]
+    assert main(args) == 0
+
+    report_path = tmp_path / "reports" / "spoofing-ablation-BTCUSDT-2023-01-03-2023-01-04.json"
+    report = json.loads(report_path.read_text())
+    assert report["horizon_s"] == 30
+    assert report["selection"]["days"] == ["2023-01-01", "2023-01-02"]
+
+
+def test_main_rejects_overlapping_periods(tmp_path):
+    args = ["ablate", "--symbol", "BTCUSDT", "--data-dir", str(tmp_path)]
+    args += ["--select-start", "2023-01-01", "--select-end", "2023-01-03"]
+    args += ["--confirm-start", "2023-01-03", "--confirm-end", "2023-01-04"]
+    assert main(args) == 2
