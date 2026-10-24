@@ -37,6 +37,14 @@
 # Window and thresholds live in a frozen ``SpoofConfig``; pick them on selection
 # data, then evaluate that exact config (``fingerprint()``) on untouched data.
 #
+# Cleaning (raw ``ofi_1s`` is never modified -- it stays recoverable as-is):
+#   * spoof_score = max(bid_score, ask_score), only when BOTH sides are known; one
+#       unknown side leaves it null (polars' max_horizontal would skip the null).
+#   * Valid OFI + known score -> ofi_clean = ofi_1s * (1 - spoof_score).
+#   * Valid OFI + unknown score -> ofi_clean = ofi_1s, flagged ``spoof_unknown``:
+#       pass the signal through rather than claim it was checked.
+#   * Invalid (null) OFI -> ofi_clean null.
+#
 # Known limitation: the aligned frame zero-fills flow on seconds without trades
 # and has no flag for a missing trade feed, so a feed outage reads as "no trades"
 # and its depletion as unexplained.
@@ -91,6 +99,12 @@ SCORE_INPUT_COLUMNS: tuple[str, ...] = tuple(
 
 #: Columns appended by :func:`side_scores`.
 SCORE_OUTPUT_COLUMNS: tuple[str, ...] = ("bid_z", "bid_score", "ask_z", "ask_score")
+
+#: Columns that must be present to clean OFI.
+CLEAN_INPUT_COLUMNS: tuple[str, ...] = ("ofi_1s", "bid_score", "ask_score")
+
+#: Columns appended by :func:`clean_ofi`.
+CLEAN_OUTPUT_COLUMNS: tuple[str, ...] = ("spoof_score", "ofi_clean", "spoof_unknown")
 
 
 @dataclass(frozen=True)
@@ -223,6 +237,29 @@ def side_scores(df: pl.DataFrame, cfg: SpoofConfig = DEFAULT_CONFIG) -> pl.DataF
         ramp = (pl.col(f"{side}_z") - cfg.z_floor) / (cfg.z_cap - cfg.z_floor)
         df = df.with_columns(ramp.clip(0.0, 1.0).alias(f"{side}_score"))
     return df
+
+
+def clean_ofi(df: pl.DataFrame) -> pl.DataFrame:
+    """Combine the side scores and down-weight raw OFI by them.
+
+    Expects :func:`side_scores` output plus ``ofi_1s``. Returns every original
+    column unchanged plus ``CLEAN_OUTPUT_COLUMNS``.
+    """
+    _check_columns(df, CLEAN_INPUT_COLUMNS, CLEAN_OUTPUT_COLUMNS)
+
+    both_known = pl.col("bid_score").is_not_null() & pl.col("ask_score").is_not_null()
+    df = df.with_columns(
+        pl.when(both_known).then(pl.max_horizontal("bid_score", "ask_score")).alias("spoof_score")
+    )
+    ofi_valid = pl.col("ofi_1s").is_not_null()
+    score_known = pl.col("spoof_score").is_not_null()
+    return df.with_columns(
+        pl.when(score_known)
+        .then(pl.col("ofi_1s") * (1 - pl.col("spoof_score")))
+        .otherwise(pl.col("ofi_1s"))
+        .alias("ofi_clean"),
+        (ofi_valid & ~score_known).alias("spoof_unknown"),
+    )
 
 
 def _check_columns(df: pl.DataFrame, required: tuple[str, ...], produced: tuple[str, ...]) -> None:

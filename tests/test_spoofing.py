@@ -8,6 +8,7 @@ from order_flow_imbalance_strategy.event_alignment import build_alignment_engine
 from order_flow_imbalance_strategy.ofi import compute_ofi
 from order_flow_imbalance_strategy.spoofing import (
     SpoofConfig,
+    clean_ofi,
     side_scores,
     trailing_stats,
     unexplained_removal,
@@ -77,6 +78,15 @@ def make_frame(rows: list[dict]) -> pl.DataFrame:
             }
         )
     return pl.DataFrame(out)
+
+
+def combine_frame(
+    ofi: list[float | None], bid: list[float | None], ask: list[float | None]
+) -> pl.DataFrame:
+    return pl.DataFrame(
+        {"ofi_1s": ofi, "bid_score": bid, "ask_score": ask},
+        schema_overrides={"ofi_1s": pl.Float64, "bid_score": pl.Float64, "ask_score": pl.Float64},
+    )
 
 
 def score_frame(
@@ -497,3 +507,40 @@ def test_fingerprint_identifies_the_exact_settings():
     ]
     ids = {c.fingerprint() for c in [SpoofConfig(), *others]}
     assert len(ids) == 4
+
+
+# Combining: spoof_score = max(bid_score, ask_score) only when BOTH are known.
+# ofi_clean = ofi_1s * (1 - spoof_score); an unknown score passes valid OFI
+# through flagged spoof_unknown; invalid (null) OFI stays null.
+
+
+def test_known_score_down_weights_ofi_by_the_worse_side():
+    # max(0.2, 0.5) = 0.5 -> 10 * 0.5 = 5; both 0 -> untouched; score 1 -> fully muted.
+    df = clean_ofi(combine_frame([10.0, -4.0, 3.0], [0.2, 0.0, 1.0], [0.5, 0.0, 0.3]))
+    assert df["spoof_score"].to_list() == pytest.approx([0.5, 0.0, 1.0])
+    assert df["ofi_clean"].to_list() == pytest.approx([5.0, -4.0, 0.0])
+    assert df["spoof_unknown"].to_list() == [False, False, False]
+
+
+def test_one_unknown_side_makes_the_combined_score_unknown():
+    # A 1.0 bid score doesn't let us call the second scored: the ask is unknown.
+    # Valid OFI passes through untouched and is flagged rather than guessed at.
+    df = clean_ofi(combine_frame([6.0, 8.0], [1.0, None], [None, None]))
+    assert df["spoof_score"].null_count() == 2
+    assert df["ofi_clean"].to_list() == [6.0, 8.0]
+    assert df["spoof_unknown"].to_list() == [True, True]
+
+
+def test_invalid_ofi_stays_null_even_with_a_known_score():
+    df = clean_ofi(combine_frame([None, None], [0.3, None], [0.1, None]))
+    assert df["ofi_clean"].null_count() == 2
+    assert df["spoof_score"][0] == pytest.approx(0.3)
+    # Nothing to be uncertain about when there's no OFI to pass through.
+    assert df["spoof_unknown"].to_list() == [False, False]
+
+
+def test_raw_ofi_column_is_left_untouched():
+    src = combine_frame([10.0, -4.0, 6.0, None], [0.2, 0.0, 1.0, 0.3], [0.5, 0.0, None, 0.1])
+    df = clean_ofi(src)
+    assert df.select(src.columns).equals(src)
+    assert df.columns == [*src.columns, "spoof_score", "ofi_clean", "spoof_unknown"]
