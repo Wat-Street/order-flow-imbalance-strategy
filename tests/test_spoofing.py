@@ -4,11 +4,16 @@ from datetime import UTC, datetime, timedelta
 import polars as pl
 import pytest
 
+from order_flow_imbalance_strategy import spoofing as SP
 from order_flow_imbalance_strategy.event_alignment import build_alignment_engine
 from order_flow_imbalance_strategy.ofi import compute_ofi
 from order_flow_imbalance_strategy.spoofing import (
+    DEFAULT_CONFIG,
+    NO_FILTER_CONFIG,
     SpoofConfig,
     clean_ofi,
+    diagnostics,
+    score_spoofing,
     side_scores,
     trailing_stats,
     unexplained_removal,
@@ -18,6 +23,12 @@ T0 = int(datetime(2023, 1, 1, 9, 0, 0, tzinfo=UTC).timestamp() * 1000)
 DAY = datetime(2023, 1, 1).date()
 BASE_DT = datetime(2023, 1, 1, 9, 0, 0)
 _TS = pl.col("timestamp").cast(pl.Datetime("ms"))
+EMPTY_TRADES = {
+    "timestamp": pl.Datetime("ms"),
+    "buy_qty": pl.Float64,
+    "sell_qty": pl.Float64,
+    "notional": pl.Float64,
+}
 
 # Columns the spoofing filter will need to read. No trade_feed_missing: the
 # real pipeline only distinguishes "no trades" (no_trades), not "no trades
@@ -37,9 +48,9 @@ SPOOFING_INPUT_COLUMNS = (
 )
 
 
+# Run the real align -> OFI path over a 10-second book with a native update
+# every second (09:00:00 .. 09:00:09).
 def _aligned_ofi(trades: pl.LazyFrame) -> pl.DataFrame:
-    """Run the real align -> OFI path over a 10-second book with a native update
-    every second (09:00:00 .. 09:00:09)."""
     n = 10
     book = pl.LazyFrame(
         {
@@ -58,10 +69,10 @@ def _aligned_ofi(trades: pl.LazyFrame) -> pl.DataFrame:
     return compute_ofi(aligned)
 
 
+# One row per second from BASE_DT (or at `sec` if given). Defaults are a
+# fresh, live book at 100.0 / 100.5 with no trades, so each test only spells
+# out the fields it is about.
 def make_frame(rows: list[dict]) -> pl.DataFrame:
-    """One row per second from BASE_DT (or at ``sec`` if given). Defaults are a
-    fresh, live book at 100.0 / 100.5 with no trades, so each test only spells
-    out the fields it is about."""
     out = []
     for i, r in enumerate(rows):
         out.append(
@@ -80,6 +91,19 @@ def make_frame(rows: list[dict]) -> pl.DataFrame:
     return pl.DataFrame(out)
 
 
+# diagnostics input: valid OFI everywhere, unknown wherever the score is null.
+def scored_frame(scores: list[float | None]) -> pl.DataFrame:
+    return pl.DataFrame(
+        {
+            "ofi_1s": [1.0] * len(scores),
+            "spoof_score": scores,
+            "spoof_unknown": [s is None for s in scores],
+            "spoof_config_version": ["l1-depletion-v1"] * len(scores),
+        },
+        schema_overrides={"spoof_score": pl.Float64},
+    )
+
+
 def combine_frame(
     ofi: list[float | None], bid: list[float | None], ask: list[float | None]
 ) -> pl.DataFrame:
@@ -89,13 +113,13 @@ def combine_frame(
     )
 
 
+# side_scores input with identical bid and ask columns, so either side can be
+# asserted on.
 def score_frame(
     removal: list[float | None],
     median: list[float | None],
     std: list[float | None],
 ) -> pl.DataFrame:
-    """side_scores input with identical bid and ask columns, so either side can be
-    asserted on."""
     cols = {"removal": removal, "prior_median": median, "prior_std": std}
     return pl.DataFrame(
         {f"{side}_{k}": v for side in ("bid", "ask") for k, v in cols.items()},
@@ -103,14 +127,14 @@ def score_frame(
     )
 
 
+# Minimal trailing_stats input: removals per second from BASE_DT. `ask`
+# defaults to a copy of `bid`; `secs` lets a test punch gaps in the grid.
 def removal_frame(
     bid: list[float | None],
     ask: list[float | None] | None = None,
     secs: list[int] | None = None,
     book_dead: list[bool] | None = None,
 ) -> pl.DataFrame:
-    """Minimal trailing_stats input: removals per second from BASE_DT. ``ask``
-    defaults to a copy of ``bid``; ``secs`` lets a test punch gaps in the grid."""
     n = len(bid)
     return pl.DataFrame(
         {
@@ -149,9 +173,9 @@ def test_aligned_ofi_output_has_the_columns_spoofing_needs():
 
 
 def test_multiple_prints_in_one_second_are_summed_not_last_print():
-    """Two sells and a buy inside 09:00:03 must sum. Keeping only the final
-    print would leave sell_qty == 0.0 and make 3.5 of real selling look like
-    unexplained bid depletion."""
+    # Two sells and a buy inside 09:00:03 must sum. Keeping only the final
+    # print would leave sell_qty == 0.0 and make 3.5 of real selling look like
+    # unexplained bid depletion.
     trades = pl.LazyFrame(
         {
             "timestamp": [T0 + 3_100, T0 + 3_400, T0 + 3_900],
@@ -321,7 +345,7 @@ def test_missing_required_column_raises():
         unexplained_removal(make_frame([{"bid_qty": 1.0, "ask_qty": 1.0}]).drop("sell_qty"))
 
 
-# Trailing stats: median / sample std of the previous ``window_s`` comparable
+# Trailing stats: median / sample std of the previous `window_s` comparable
 # removals, never the current one. window_s=4 keeps the arithmetic hand-checkable.
 SMALL = SpoofConfig(window_s=4, min_obs=2)
 
@@ -544,3 +568,82 @@ def test_raw_ofi_column_is_left_untouched():
     df = clean_ofi(src)
     assert df.select(src.columns).equals(src)
     assert df.columns == [*src.columns, "spoof_score", "ofi_clean", "spoof_unknown"]
+
+
+# Pipeline: score_spoofing runs removal -> stats -> scores -> clean and stamps the
+# config; NO_FILTER_CONFIG is the "filter off" arm of the ablation.
+
+
+def test_score_spoofing_runs_on_real_aligned_ofi_and_stamps_the_config():
+    trades = pl.LazyFrame(
+        {"timestamp": [T0 + 3_000], "buy_qty": [0.0], "sell_qty": [1.0], "notional": [100.0]}
+    ).with_columns(_TS)
+    src = _aligned_ofi(trades)
+    cfg = SpoofConfig(window_s=3)
+
+    df = score_spoofing(src, cfg)
+
+    assert df.select(src.columns).equals(src)  # nothing upstream is rewritten
+    for c in ("bid_removal", "warm_up", "bid_score", "spoof_score", "ofi_clean"):
+        assert c in df.columns
+    assert df["spoof_config_version"].unique().to_list() == [cfg.version]
+    assert df["spoof_config_id"].unique().to_list() == [cfg.fingerprint()]
+
+
+def test_invalid_ofi_stays_null_through_the_whole_pipeline():
+    # The real align -> OFI frame nulls OFI everywhere outside 09:00:01..09, so
+    # nearly the whole day is invalid OFI that must stay invalid after cleaning.
+    df = score_spoofing(_aligned_ofi(pl.LazyFrame(schema=EMPTY_TRADES)), SpoofConfig(window_s=3))
+    invalid = df.filter(pl.col("ofi_1s").is_null())
+    assert invalid.height > 0
+    assert invalid["ofi_clean"].null_count() == invalid.height
+    assert not invalid["spoof_unknown"].any()
+
+
+def test_no_filter_baseline_scores_zero_only_where_ofi_is_valid():
+    src = pl.DataFrame(
+        {
+            "timestamp": [BASE_DT + timedelta(seconds=i) for i in range(3)],
+            "ofi_1s": [1.5, None, -2.0],
+        }
+    )
+    df = score_spoofing(src, NO_FILTER_CONFIG)
+    assert df["spoof_score"].to_list() == [0.0, None, 0.0]
+    assert df["ofi_clean"].to_list() == [1.5, None, -2.0]
+    assert df["spoof_unknown"].to_list() == [False, False, False]
+    assert df["spoof_config_version"][0] == "no-filter-v1"
+
+
+def test_no_filter_baseline_is_a_distinct_configuration():
+    assert NO_FILTER_CONFIG.version != DEFAULT_CONFIG.version
+    assert NO_FILTER_CONFIG.fingerprint() != DEFAULT_CONFIG.fingerprint()
+
+
+def test_diagnostics_warns_when_over_ten_percent_of_scored_rows_exceed_half(caplog):
+    # 8 scored rows (2 unknown), 2 above 0.5 -> 25% > 10%. Unknown rows are not
+    # in the denominator: they aren't evidence either way.
+    SP.logger.disabled = False  # same ingest_data dictConfig issue as test_event_alignment
+    with caplog.at_level("WARNING", logger=SP.logger.name):
+        out = diagnostics(scored_frame([0.0, 0.9, None, 0.1, 0.6, 0.0, 0.0, 0.2, None, 0.0]))
+    assert out["n_scored"] == 8
+    assert out["n_unknown"] == 2
+    assert out["n_high"] == 2
+    assert out["frac_high"] == pytest.approx(0.25)
+    assert out["warned"] is True
+    assert "25.0%" in caplog.text
+
+
+def test_diagnostics_is_quiet_at_exactly_ten_percent(caplog):
+    SP.logger.disabled = False
+    with caplog.at_level("WARNING", logger=SP.logger.name):
+        out = diagnostics(scored_frame([0.9] + [0.0] * 9))
+    assert out["frac_high"] == pytest.approx(0.10)
+    assert out["warned"] is False
+    assert caplog.text == ""
+
+
+def test_diagnostics_with_nothing_scored_has_no_fraction():
+    out = diagnostics(scored_frame([None, None]))
+    assert out["n_scored"] == 0
+    assert out["frac_high"] is None
+    assert out["warned"] is False
