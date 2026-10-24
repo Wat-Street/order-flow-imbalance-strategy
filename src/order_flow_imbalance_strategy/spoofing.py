@@ -1,14 +1,26 @@
 # L1 cancellation-suspicion filter: down-weights OFI by unexplained queue removal.
 # note: aligned flow is zero-filled, so a missing trade feed reads as "no trades"
+# run: python -m order_flow_imbalance_strategy.spoofing --symbols BTCUSDT
+#          --start 2024-01-01 --end 2024-01-31 [--baseline]
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import logging
+import sys
+from collections import Counter
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
+from datetime import date
+from pathlib import Path
+from typing import Any
 
 import polars as pl
+from tqdm import tqdm
+
+from order_flow_imbalance_strategy.ofi import daterange, parse_date, signal_path
 
 logger = logging.getLogger("SpoofingFilter")
 
@@ -274,3 +286,135 @@ def _identifiable(price: str, qty: str, opposing_flow: str, clean_pair: pl.Expr)
 # max(0, prev_qty - qty - opposing_flow)
 def _depletion(qty: str, opposing_flow: str) -> pl.Expr:
     return (pl.col(qty).shift(1) - pl.col(qty) - pl.col(opposing_flow)).clip(lower_bound=0.0)
+
+
+# output file for one symbol-day; the config version keeps filtered and baseline runs apart
+def spoof_path(data_dir: Path, symbol: str, day: date, cfg: SpoofConfig) -> Path:
+    name = f"{symbol}-ofi-spoof-{cfg.version}-{day:%Y-%m-%d}.parquet"
+    return data_dir / "signals" / symbol / name
+
+
+# one task per day that has an OFI file
+def build_tasks(
+    symbols: list[str], start: date, end: date, data_dir: Path, cfg: SpoofConfig
+) -> list[dict[str, Any]]:
+    tasks: list[dict[str, Any]] = []
+    for symbol in symbols:
+        for day in daterange(start, end):
+            in_path = signal_path(data_dir, symbol, day)
+            if not in_path.exists():
+                continue
+            tasks.append(
+                {
+                    "symbol": symbol,
+                    "date": f"{day:%Y-%m-%d}",
+                    "in_path": str(in_path),
+                    "out_path": str(spoof_path(data_dir, symbol, day, cfg)),
+                    "cfg": cfg,
+                }
+            )
+    return tasks
+
+
+# score and write one symbol-day; never raises so one bad day can't crash the pool
+def process_file(task: dict[str, Any]) -> dict[str, Any]:
+    in_path = Path(task["in_path"])
+    out_path = Path(task["out_path"])
+    status: dict[str, Any] = {"symbol": task["symbol"], "date": task["date"], "status": "error"}
+
+    try:
+        if out_path.exists():
+            status["status"] = "skipped"
+            return status
+        if not in_path.exists():
+            status["status"] = "no_input"
+            status["message"] = f"missing input {in_path}"
+            return status
+
+        df = pl.read_parquet(in_path)
+        out = score_spoofing(df, task["cfg"])
+
+        # raw OFI has to come back unchanged, row for row
+        raw = df.sort("timestamp")["ofi_1s"]
+        if out.height != df.height or not out.sort("timestamp")["ofi_1s"].equals(raw):
+            status["message"] = "validation failed: ofi_1s changed"
+            return status
+
+        report = diagnostics(out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+        out.write_parquet(tmp_path)
+        tmp_path.replace(out_path)
+
+        status.update(status="ok", **report)
+        return status
+    except Exception as exc:  # noqa: BLE001 - workers must never propagate
+        status["message"] = f"{type(exc).__name__}: {exc}"
+        return status
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Score OFI days for L1 cancellation suspicion")
+    parser.add_argument("--symbols", nargs="+", required=True, help="e.g. BTCUSDT ETHUSDT")
+    parser.add_argument("--start", type=parse_date, required=True, help="start date YYYY-MM-DD")
+    parser.add_argument("--end", type=parse_date, required=True, help="end date YYYY-MM-DD")
+    parser.add_argument("--workers", type=int, default=4, help="process pool size (default 4)")
+    parser.add_argument(
+        "--data-dir", type=Path, default=Path("data"), help="root data dir (default ./data)"
+    )
+    parser.add_argument(
+        "--baseline", action="store_true", help="write the no-filter baseline instead"
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+
+    if args.end < args.start:
+        print(f"error: --end {args.end} is before --start {args.start}", file=sys.stderr)
+        return 2
+
+    cfg = NO_FILTER_CONFIG if args.baseline else DEFAULT_CONFIG
+    tasks = build_tasks(args.symbols, args.start, args.end, args.data_dir, cfg)
+    if not tasks:
+        print("No OFI input files found for the requested symbols/range.")
+        return 0
+
+    counts: Counter[str] = Counter()
+    noisy_days: list[str] = []
+    failures: list[dict[str, Any]] = []
+
+    with ProcessPoolExecutor(max_workers=max(1, args.workers)) as pool:
+        futures = [pool.submit(process_file, task) for task in tasks]
+        for future in tqdm(as_completed(futures), total=len(tasks), desc="Spoof", unit="day"):
+            result = future.result()
+            counts[result["status"]] += 1
+            if result["status"] == "error":
+                failures.append(result)
+            elif result["status"] == "ok" and result["warned"]:
+                noisy_days.append(
+                    f"{result['symbol']} {result['date']}: {100 * result['frac_high']:.1f}%"
+                )
+
+    print(f"\nSummary ({cfg.version}, id {cfg.fingerprint()}):")
+    for status in ("ok", "skipped", "no_input", "error"):
+        if counts[status]:
+            print(f"  {status:>9}: {counts[status]}")
+
+    if noisy_days:
+        print(f"\n{len(noisy_days)} day(s) with >10% of scored rows above 0.5:")
+        for line in noisy_days[:20]:
+            print(f"  - {line}")
+
+    if failures:
+        print(f"\n{len(failures)} failure(s):", file=sys.stderr)
+        for f in failures[:20]:
+            print(f"  - {f['symbol']} {f['date']}: {f.get('message')}", file=sys.stderr)
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

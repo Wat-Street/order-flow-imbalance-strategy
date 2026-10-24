@@ -1,5 +1,6 @@
+import random
 from dataclasses import FrozenInstanceError
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import polars as pl
 import pytest
@@ -11,8 +12,11 @@ from order_flow_imbalance_strategy.spoofing import (
     DEFAULT_CONFIG,
     NO_FILTER_CONFIG,
     SpoofConfig,
+    build_tasks,
     clean_ofi,
     diagnostics,
+    main,
+    process_file,
     score_spoofing,
     side_scores,
     trailing_stats,
@@ -92,6 +96,25 @@ def make_frame(rows: list[dict]) -> pl.DataFrame:
 
 
 # diagnostics input: valid OFI everywhere, unknown wherever the score is null.
+# A synthetic aligned day: a live book that sometimes ticks, with random queues and
+# flow, so every stage has real work to do. Seeded so it's reproducible.
+def synthetic_day(n: int, seed: int) -> pl.DataFrame:
+    rng = random.Random(seed)
+    return pl.DataFrame(
+        {
+            "timestamp": [BASE_DT + timedelta(seconds=i) for i in range(n)],
+            "bid_price": [100.0 + 0.1 * rng.randint(0, 1) for _ in range(n)],
+            "ask_price": [100.5 + 0.1 * rng.randint(0, 1) for _ in range(n)],
+            "bid_qty": [rng.expovariate(1 / 5) for _ in range(n)],
+            "ask_qty": [rng.expovariate(1 / 5) for _ in range(n)],
+            "buy_qty": [rng.expovariate(1.0) for _ in range(n)],
+            "sell_qty": [rng.expovariate(1.0) for _ in range(n)],
+            "book_stale": [rng.random() < 0.05 for _ in range(n)],
+            "book_dead": [False] * n,
+        }
+    )
+
+
 def scored_frame(scores: list[float | None]) -> pl.DataFrame:
     return pl.DataFrame(
         {
@@ -647,3 +670,120 @@ def test_diagnostics_with_nothing_scored_has_no_fraction():
     assert out["n_scored"] == 0
     assert out["frac_high"] is None
     assert out["warned"] is False
+
+
+# Whole pipeline: future rows can't change earlier scores, and the per-day runner.
+
+
+def test_scores_do_not_depend_on_future_rows():
+    # Empty both queues and stop all trading after the cut, which turns the next
+    # identifiable second into a large removal. Nothing up to the cut may change.
+    cfg = SpoofConfig(window_s=30)
+    base = synthetic_day(200, seed=0)
+    for cut in range(60, 180, 10):
+        later = pl.int_range(pl.len()) > cut
+        perturbed = base.with_columns(
+            [
+                pl.when(later).then(0.0).otherwise(pl.col(c)).alias(c)
+                for c in ("bid_qty", "ask_qty", "buy_qty", "sell_qty")
+            ]
+        )
+        a = score_spoofing(compute_ofi(base), cfg).head(cut + 1)
+        b = score_spoofing(compute_ofi(perturbed), cfg).head(cut + 1)
+        assert a["spoof_score"].drop_nulls().len() > 0  # something was actually scored
+        assert a.equals(b), f"rows up to {cut} changed"
+
+
+def test_process_file_writes_scored_day_and_is_idempotent(tmp_path):
+    src = compute_ofi(synthetic_day(50, seed=1))
+    in_path = tmp_path / "BTCUSDT-ofi-A-2023-01-01.parquet"
+    out_path = tmp_path / "BTCUSDT-ofi-spoof-x-2023-01-01.parquet"
+    src.write_parquet(in_path)
+    task = {
+        "symbol": "BTCUSDT",
+        "date": "2023-01-01",
+        "in_path": str(in_path),
+        "out_path": str(out_path),
+        "cfg": SpoofConfig(window_s=10),
+    }
+
+    r1 = process_file(task)
+    assert r1["status"] == "ok"
+    assert r1["n_rows"] == 50
+    assert "frac_high" in r1  # diagnostics ride along in the status
+    out = pl.read_parquet(out_path)
+    assert out["ofi_1s"].equals(src["ofi_1s"])  # raw OFI recoverable from the file
+    assert process_file(task)["status"] == "skipped"
+
+
+def test_process_file_missing_input_returns_no_input(tmp_path):
+    task = {
+        "symbol": "BTCUSDT",
+        "date": "2023-01-01",
+        "in_path": str(tmp_path / "nope.parquet"),
+        "out_path": str(tmp_path / "out.parquet"),
+        "cfg": DEFAULT_CONFIG,
+    }
+    assert process_file(task)["status"] == "no_input"
+
+
+def test_build_tasks_reads_ofi_files_and_names_output_by_config(tmp_path):
+    # Only days with an OFI file become tasks; the version in the output name keeps
+    # filtered and baseline runs from overwriting each other.
+    signals = tmp_path / "signals" / "BTCUSDT"
+    signals.mkdir(parents=True)
+    (signals / "BTCUSDT-ofi-A-2023-01-01.parquet").write_bytes(b"")
+    tasks = build_tasks(["BTCUSDT"], date(2023, 1, 1), date(2023, 1, 2), tmp_path, DEFAULT_CONFIG)
+    assert len(tasks) == 1
+    assert tasks[0]["out_path"].endswith("BTCUSDT-ofi-spoof-l1-depletion-v1-2023-01-01.parquet")
+    baseline = build_tasks(
+        ["BTCUSDT"], date(2023, 1, 1), date(2023, 1, 1), tmp_path, NO_FILTER_CONFIG
+    )
+    assert baseline[0]["out_path"].endswith("BTCUSDT-ofi-spoof-no-filter-v1-2023-01-01.parquet")
+
+
+def test_main_scores_existing_days_and_baseline_flag_writes_separately(tmp_path):
+    signals = tmp_path / "signals" / "BTCUSDT"
+    signals.mkdir(parents=True)
+    compute_ofi(synthetic_day(50, seed=2)).write_parquet(
+        signals / "BTCUSDT-ofi-A-2023-01-01.parquet"
+    )
+    args = ["--symbols", "BTCUSDT", "--start", "2023-01-01", "--end", "2023-01-01"]
+    args += ["--data-dir", str(tmp_path), "--workers", "1"]
+
+    assert main(args) == 0
+    assert main([*args, "--baseline"]) == 0
+    assert (signals / "BTCUSDT-ofi-spoof-l1-depletion-v1-2023-01-01.parquet").exists()
+    assert (signals / "BTCUSDT-ofi-spoof-no-filter-v1-2023-01-01.parquet").exists()
+
+
+def test_main_end_before_start_returns_2(tmp_path):
+    rc = main(
+        [
+            "--symbols",
+            "BTCUSDT",
+            "--start",
+            "2023-01-02",
+            "--end",
+            "2023-01-01",
+            "--data-dir",
+            str(tmp_path),
+        ]
+    )
+    assert rc == 2
+
+
+def test_main_no_inputs_returns_0(tmp_path):
+    rc = main(
+        [
+            "--symbols",
+            "BTCUSDT",
+            "--start",
+            "2023-01-01",
+            "--end",
+            "2023-01-01",
+            "--data-dir",
+            str(tmp_path),
+        ]
+    )
+    assert rc == 0
