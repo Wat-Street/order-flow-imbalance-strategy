@@ -13,6 +13,7 @@ import argparse
 import hashlib
 import json
 import logging
+import multiprocessing
 import sys
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -440,7 +441,9 @@ def _score_days(args: argparse.Namespace) -> int:
     noisy_days: list[str] = []
     failures: list[dict[str, Any]] = []
 
-    with ProcessPoolExecutor(max_workers=max(1, args.workers)) as pool:
+    # spawn, not fork: a forked child inherits polars' thread pool mid-lock and deadlocks
+    spawn = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=max(1, args.workers), mp_context=spawn) as pool:
         futures = [pool.submit(process_file, task) for task in tasks]
         for future in tqdm(as_completed(futures), total=len(tasks), desc="Spoof", unit="day"):
             result = future.result()
